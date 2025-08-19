@@ -803,16 +803,7 @@ class _DeckPageState extends State<DeckPage> {
 
   // -------- Export honoring Settings (ask/docs/custom) --------
   Future<void> _exportDeck() async {
-    const bool compressGzip = true;
-    const int maxDim = 1280;
-    const int jpegQuality = 80;
-
-    final slug = _safeFileSlug(widget.deck.name);
-    final baseName = 'deck_${slug}_${DateTime.now().millisecondsSinceEpoch}';
-    final fileNameJson = '$baseName.json';
-    final fileNameGz = '$fileNameJson.gz';
-
-    // progress dialog — DO NOT await; we’ll close it manually
+    // Small progress dialog (non-blocking)
     final progress = ValueNotifier<double>(0);
     var dialogOpen = true;
     // ignore: unawaited_futures
@@ -830,7 +821,7 @@ class _DeckPageState extends State<DeckPage> {
               children: [
                 LinearProgressIndicator(value: (p > 0 && p < 1) ? p : null),
                 const SizedBox(height: 8),
-                Text(p > 0 ? '${(p * 100).toStringAsFixed(0)} %' : 'Optimizing...')
+                Text(p > 0 ? '${(p * 100).toStringAsFixed(0)} %' : 'Writing file...')
               ],
             ),
           ),
@@ -839,113 +830,83 @@ class _DeckPageState extends State<DeckPage> {
     ).then((_) => dialogOpen = false);
 
     try {
-      // 1) downscale images
-      final optimized = <FlashcardData>[];
-      final total = _cards.isEmpty ? 1 : _cards.length;
+      // File name
+      final slug = _safeFileSlug(widget.deck.name);
+      final fileName = 'deck_${slug}_${DateTime.now().millisecondsSinceEpoch}.json';
+
+      // 1) Write JSON **streaming** to a temp file (no giant in-memory string)
+      final tmpDir = await getTemporaryDirectory();
+      final tmpPath = p.join(tmpDir.path, fileName);
+      final file = io.File(tmpPath);
+      final sink = file.openWrite();
+
+      // Write header
+      sink.write('{"schema":"flashcards.simple.v1",');
+      sink.write('"deck":{"id":');
+      sink.write(jsonEncode(widget.deck.id));
+      sink.write(',"name":');
+      sink.write(jsonEncode(widget.deck.name));
+      sink.write('},"exportedAt":');
+      sink.write(jsonEncode(DateTime.now().toIso8601String()));
+      sink.write(',"cards":[');
+
+      // Stream the cards, one by one
       for (int i = 0; i < _cards.length; i++) {
         final c = _cards[i];
-        final front = await downscaleDataUrl(c.front, maxDim: maxDim, jpegQuality: jpegQuality);
-        final back  = await downscaleDataUrl(c.back,  maxDim: maxDim, jpegQuality: jpegQuality);
-        optimized.add(c.copyWith(front: front, back: back));
-        if (i % 8 == 0 || i == _cards.length - 1) {
-          progress.value = (i + 1) / total;
+        // If your images can be huge, you can downscale here first (optional):
+        // final front = await downscaleDataUrl(c.front);
+        // final back  = await downscaleDataUrl(c.back);
+        final obj = {
+          "id": c.id,
+          "title": c.title,
+          "front": c.front, // or front
+          "back": c.back,   // or back
+        };
+        if (i > 0) sink.write(',');
+        sink.write(jsonEncode(obj));
+
+        // Update progress occasionally
+        if (i % 50 == 0 || i == _cards.length - 1) {
+          progress.value = _cards.isEmpty ? 1.0 : (i + 1) / _cards.length;
+          // Yield to UI a tiny bit
           await Future<void>.delayed(const Duration(milliseconds: 1));
         }
       }
 
-      // 2) build JSON
-      final deck = {
-        'schema': 'flashcards.simple.v1',
-        'deck': {'id': widget.deck.id, 'name': widget.deck.name},
-        'exportedAt': DateTime.now().toIso8601String(),
-        'cards': optimized.map((c) => c.toJson()).toList(),
-      };
-      final jsonStr = const JsonEncoder.withIndent('  ').convert(deck);
+      // Close array + object, flush/close the sink
+      sink.write(']}');
+      await sink.flush();
+      await sink.close();
 
-      // close progress before showing any system picker
+      // Close progress before opening any system UI
       if (dialogOpen) Navigator.of(context, rootNavigator: true).pop();
 
-      if (kIsWeb) {
-        // web: copy dialog
-        await showDialog(
-          context: context,
-          builder: (ctx) => AlertDialog(
-            title: const Text('Export Deck (Copy & Share)'),
-            content: SizedBox(
-              width: 520, height: 360,
-              child: SingleChildScrollView(
-                child: SelectableText(jsonStr, style: const TextStyle(fontSize: 12)),
-              ),
-            ),
-            actions: [
-              TextButton(
-                onPressed: () async {
-                  await services.Clipboard.setData(services.ClipboardData(text: jsonStr));
-                  if (ctx.mounted) Navigator.of(ctx).pop();
-                },
-                child: const Text('Copy'),
-              ),
-              TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Close')),
-            ],
-          ),
-        );
-        return;
-      }
+      // 2) Use SAF / iOS Files: user chooses where to save
+      final savedPath = await FlutterFileDialog.saveFile(
+        params: SaveFileDialogParams(
+          sourceFilePath: tmpPath,
+          fileName: fileName,
+        ),
+      );
 
-      if (io.Platform.isAndroid || io.Platform.isIOS) {
-        final tmpDir = await getTemporaryDirectory();
-        late final String srcPath;
-        late final String suggest;
-
-        if (compressGzip) {
-          final gzBytes = GZipEncoder().encode(utf8.encode(jsonStr))!;
-          srcPath = p.join(tmpDir.path, fileNameGz);
-          await io.File(srcPath).writeAsBytes(gzBytes);
-          suggest = fileNameGz;
-        } else {
-          srcPath = p.join(tmpDir.path, fileNameJson);
-          await io.File(srcPath).writeAsString(jsonStr);
-          suggest = fileNameJson;
-        }
-
-        final saved = await FlutterFileDialog.saveFile(
-          params: SaveFileDialogParams(sourceFilePath: srcPath, fileName: suggest),
-        );
-
-        if (!mounted) return;
+      if (!mounted) return;
+      if (savedPath == null || savedPath.isEmpty) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(saved?.isNotEmpty == true ? 'Saved to: $saved' : 'Export canceled')),
+          const SnackBar(content: Text('Export canceled')),
         );
-        return;
-      }
-
-      // desktop
-      final dir = await FilePicker.platform.getDirectoryPath(dialogTitle: 'Choose export folder');
-      if (dir == null || dir.isEmpty) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Export canceled')));
-        }
-        return;
-      }
-
-      if (compressGzip) {
-        final gzBytes = GZipEncoder().encode(utf8.encode(jsonStr))!;
-        final outPath = p.join(dir, fileNameGz);
-        await io.File(outPath).writeAsBytes(gzBytes);
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Saved to: $outPath')));
-        }
       } else {
-        final outPath = p.join(dir, fileNameJson);
-        await io.File(outPath).writeAsString(jsonStr);
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Saved to: $outPath')));
-        }
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Saved to: $savedPath')),
+        );
       }
     } catch (e) {
-      if (dialogOpen) Navigator.of(context, rootNavigator: true).pop();
+      if (dialogOpen) {
+        Navigator.of(context, rootNavigator: true).pop();
+      }
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Export failed: $e')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Export failed: $e')),
+        );
       }
     }
   }
