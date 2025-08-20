@@ -4,25 +4,85 @@
 // ============================================================================
 
 import 'dart:convert';
+import 'dart:isolate';
+import 'dart:typed_data';
 import 'dart:io' as io;
 
+import 'package:archive/archive_io.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flip_card/flip_card.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' as services; // Clipboard
 import 'package:image_picker/image_picker.dart';
+import 'package:image/image.dart' as img;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_file_dialog/flutter_file_dialog.dart';
-import 'package:share_plus/share_plus.dart';
-import 'package:image/image.dart' as img;
-import 'package:archive/archive_io.dart';
-import 'dart:isolate';
 
 
 
+// Runs in a background isolate and sends batches of cards back to the UI isolate.
+void parseDeckIsolate(Map<String, dynamic> args) async {
+  final send = args['send'] as SendPort;
+  final path = args['path'] as String;
+
+  try {
+    final lower = path.toLowerCase();
+    final isGz = lower.endsWith('.gz');
+    final isJsonl = lower.endsWith('.jsonl');
+
+    if (isJsonl) {
+      final f = io.File(path);
+      final totalBytes = await f.length();
+      int seen = 0;
+      final List<Map<String, dynamic>> batch = [];
+      await for (final line in f.openRead().transform(utf8.decoder).transform(const LineSplitter())) {
+        seen += line.length + 1;
+        try {
+          final obj = jsonDecode(line);
+          if (obj is Map<String, dynamic>) batch.add(obj);
+        } catch (_) {}
+        if (batch.length >= 100) {
+          send.send({'type': 'batch', 'cards': List.of(batch), 'progress': (totalBytes == 0) ? null : seen / totalBytes});
+          batch.clear();
+        }
+      }
+      if (batch.isNotEmpty) send.send({'type': 'batch', 'cards': List.of(batch), 'progress': 1.0});
+      send.send({'type': 'done'});
+      return;
+    }
+
+    final raw = await io.File(path).readAsBytes();
+    final Uint8List jsonBytes = isGz
+        ? Uint8List.fromList(GZipDecoder().decodeBytes(raw))
+        : raw;
+
+    final decoded = jsonDecode(utf8.decode(jsonBytes));
+    if (decoded is! Map<String, dynamic>) throw FormatException('Invalid deck JSON (root)');
+    if (decoded['schema'] != 'flashcards.simple.v1') throw FormatException('Unknown deck schema');
+    final cards = decoded['cards'];
+    if (cards is! List) throw FormatException('Invalid cards array');
+
+    const batchSize = 200;
+    final total = cards.isEmpty ? 1 : cards.length;
+    List<Map<String, dynamic>> batch = [];
+    for (int i = 0; i < cards.length; i++) {
+      final item = cards[i];
+      if (item is Map) batch.add(item.cast<String, dynamic>());
+      if (batch.length >= batchSize || i == cards.length - 1) {
+        send.send({'type': 'batch', 'cards': batch, 'progress': (i + 1) / total});
+        batch = [];
+      }
+    }
+
+    send.send({'type': 'done'});
+  } catch (e, st) {
+    send.send({'type': 'error', 'message': e.toString(), 'stack': st.toString()});
+  }
+}
 
 
 
@@ -958,7 +1018,7 @@ class _DeckPageState extends State<DeckPage> {
   Future<void> _importDeck() async {
     final res = await FilePicker.platform.pickFiles(
       type: FileType.custom,
-      allowedExtensions: ['json', 'jsonl', 'deckjson', 'json.gz'],
+      allowedExtensions: ['json', 'jsonl', 'json.gz', 'deckjson'],
       withData: false,
     );
     if (res == null || res.files.isEmpty) return;
@@ -966,142 +1026,100 @@ class _DeckPageState extends State<DeckPage> {
     final path = res.files.single.path;
     if (path == null) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('No file path available')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No file path available')),
+        );
       }
       return;
     }
 
-    final progress = ValueNotifier<double>(0);   // 0..1
-    final cancel = ValueNotifier<bool>(false);
-    var dialogOpen = true;
-    // ignore: unawaited_futures
+    // Progress dialog
+    final progress = ValueNotifier<double?>(null);
+    bool dialogOpen = true;
     showDialog(
       context: context,
       barrierDismissible: false,
-      builder: (ctx) => WillPopScope(
+      builder: (_) => WillPopScope(
         onWillPop: () async => false,
         child: AlertDialog(
           title: const Text('Importing deck...'),
-          content: ValueListenableBuilder<double>(
+          content: ValueListenableBuilder<double?>(
             valueListenable: progress,
             builder: (_, p, __) => Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                LinearProgressIndicator(value: (p > 0 && p < 1) ? p : null),
-                const SizedBox(height: 12),
-                Text(p > 0 ? '${(p * 100).toStringAsFixed(0)} %' : 'Preparing...'),
+                LinearProgressIndicator(value: p),
+                const SizedBox(height: 8),
+                Text(p == null ? 'Starting…' : '${(p * 100).toStringAsFixed(0)} %'),
               ],
             ),
           ),
-          actions: [
-            ValueListenableBuilder<bool>(
-              valueListenable: cancel,
-              builder: (_, isCancel, __) => TextButton(
-                onPressed: () => cancel.value = true,
-                child: Text(isCancel ? 'Canceling...' : 'Cancel'),
-              ),
-            ),
-          ],
         ),
       ),
     ).then((_) => dialogOpen = false);
 
+    final rp = ReceivePort();
+    await Isolate.spawn(parseDeckIsolate, {'send': rp.sendPort, 'path': path});
+
+    final imported = <FlashcardData>[];
+
     try {
-      final lower = path.toLowerCase();
-      final isGz = lower.endsWith('.gz');
-      final isJsonl = lower.endsWith('.jsonl');
-
-      final imported = <FlashcardData>[];
-
-      if (isJsonl) {
-        // stream line-by-line
-        final f = io.File(path);
-        final totalBytes = await f.length();
-        int seen = 0;
-
-        await for (final line in f.openRead().transform(utf8.decoder).transform(const LineSplitter())) {
-          if (cancel.value) break;
-          seen += line.length + 1;
-          try {
-            final obj = jsonDecode(line);
-            if (obj is Map) {
-              final c = FlashcardData.fromJson(obj.cast<String, dynamic>());
-              if (c.front.startsWith('data:') && c.back.startsWith('data:')) {
-                imported.add(c);
-              }
+      await for (final msg in rp) {
+        if (msg is! Map) continue;
+        final map = msg.cast<String, dynamic>();
+        switch (map['type']) {
+          case 'batch':
+            final list = (map['cards'] as List).cast<Map<String, dynamic>>();
+            for (final m in list) {
+              try {
+                final c = FlashcardData.fromJson(m);
+                if (c.front.startsWith('data:') && c.back.startsWith('data:')) {
+                  imported.add(c);
+                }
+              } catch (_) {}
             }
-          } catch (_) {}
-          if (totalBytes > 0) progress.value = seen / totalBytes;
-          await Future<void>.delayed(const Duration(milliseconds: 1));
-        }
-      } else {
-        // .json or .json.gz
-        final rawBytes = await io.File(path).readAsBytes();
+            final p = map['progress'];
+            if (p is num) progress.value = p.toDouble().clamp(0.0, 1.0);
+            break;
 
-        // decompress in isolate if needed
-        final Uint8List jsonBytes = isGz
-            ? (await Isolate.run(() => Uint8List.fromList(GZipDecoder().decodeBytes(rawBytes))))
-            : rawBytes;
+          case 'done':
+            rp.close();
+            break;
 
-        // decode+parse in isolate
-        final Map<String, dynamic> decoded = await Isolate.run(() {
-          final jsonStr = utf8.decode(jsonBytes);
-          final obj = jsonDecode(jsonStr);
-          if (obj is! Map<String, dynamic>) throw Exception('Invalid deck JSON');
-          return obj;
-        });
-
-        if (decoded['schema'] != 'flashcards.simple.v1') {
-          throw Exception('Unknown deck schema');
-        }
-
-        final cardsJson = decoded['cards'];
-        if (cardsJson is! List) throw Exception('Invalid cards array');
-
-        final total = cardsJson.isEmpty ? 1 : cardsJson.length;
-        const batch = 50;
-        for (int i = 0; i < cardsJson.length; i++) {
-          if (cancel.value) break;
-          final item = cardsJson[i];
-          if (item is Map) {
-            try {
-              final c = FlashcardData.fromJson(item.cast<String, dynamic>());
-              if (c.front.startsWith('data:') && c.back.startsWith('data:')) {
-                imported.add(c);
-              }
-            } catch (_) {}
-          }
-          if (i % batch == 0 || i == cardsJson.length - 1) {
-            progress.value = (i + 1) / total;
-            await Future<void>.delayed(const Duration(milliseconds: 1));
-          }
+          case 'error':
+            rp.close();
+            throw Exception(map['message'] ?? 'Unknown parser error');
         }
       }
 
-      if (cancel.value) return;
-
       if (imported.isEmpty) {
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('No valid cards found')));
+          if (dialogOpen) Navigator.of(context, rootNavigator: true).pop();
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('No valid cards found')),
+          );
         }
         return;
       }
 
       final ids = _cards.map((e) => e.id).toSet();
       final merged = [..._cards, ...imported.where((c) => !ids.contains(c.id))];
+
       setState(() => _cards = merged);
       await _save();
 
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Imported ${imported.length} card(s)')));
+        if (dialogOpen) Navigator.of(context, rootNavigator: true).pop();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Imported ${imported.length} card(s)')),
+        );
       }
     } catch (e) {
+      if (dialogOpen) Navigator.of(context, rootNavigator: true).pop();
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Import failed: $e')));
-      }
-    } finally {
-      if (dialogOpen) {
-        Navigator.of(context, rootNavigator: true).pop();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Import failed: $e')),
+        );
       }
     }
   }
@@ -1109,7 +1127,8 @@ class _DeckPageState extends State<DeckPage> {
 
 
 
-@override
+
+  @override
   Widget build(BuildContext context) {
     final body = _loading
         ? const Center(child: CircularProgressIndicator())
