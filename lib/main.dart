@@ -729,7 +729,7 @@ class _DeckPageState extends State<DeckPage> {
   }
 
   // In _DeckPageState
-  Widget _gridTile(FlashcardData card) {
+  Widget _gridTile(FlashcardData card, int index) {
     return Card(
       elevation: 2,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
@@ -737,10 +737,11 @@ class _DeckPageState extends State<DeckPage> {
         borderRadius: BorderRadius.circular(12),
         onTap: () => Navigator.of(context).push(
           MaterialPageRoute(
-            builder: (_) => ViewFlashcardPage(
-              card: card,
-              onEdit: () => _edit(card),
-              onDelete: () => _delete(card),
+            builder: (_) => SwipeViewerPage(
+              cards: _cards,                 // pass the list
+              initialIndex: index,           // start at tapped card
+              onEdit: (c) => _edit(c),       // keep your edit/delete actions
+              onDelete: (c) => _delete(c),
             ),
           ),
         ),
@@ -755,11 +756,7 @@ class _DeckPageState extends State<DeckPage> {
             ),
             ListTile(
               dense: true,
-              title: Text(
-                card.title,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
+              title: Text(card.title, maxLines: 1, overflow: TextOverflow.ellipsis),
               trailing: PopupMenuButton<String>(
                 onSelected: (v) {
                   if (v == 'edit') _edit(card);
@@ -1159,7 +1156,7 @@ class _DeckPageState extends State<DeckPage> {
           crossAxisSpacing: 12,
           childAspectRatio: 0.72,
         ),
-        itemBuilder: (_, i) => _gridTile(_cards[i]),
+        itemBuilder: (_, i) => _gridTile(_cards[i], i),
       ),
     );
 
@@ -1383,3 +1380,133 @@ class ViewFlashcardPage extends StatelessWidget {
     );
   }
 }
+class SwipeViewerPage extends StatefulWidget {
+  final List<FlashcardData> cards;
+  final int initialIndex;
+  final Future<void> Function(FlashcardData)? onEdit;
+  final Future<void> Function(FlashcardData)? onDelete;
+
+  const SwipeViewerPage({
+    super.key,
+    required this.cards,
+    required this.initialIndex,
+    this.onEdit,
+    this.onDelete,
+  });
+
+  @override
+  State<SwipeViewerPage> createState() => _SwipeViewerPageState();
+}
+
+class _SwipeViewerPageState extends State<SwipeViewerPage> {
+  late final PageController _controller;
+  late int _index;
+
+  @override
+  void initState() {
+    super.initState();
+    _index = widget.initialIndex.clamp(0, widget.cards.length - 1);
+    _controller = PageController(initialPage: _index);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _go(int delta) {
+    final next = (_index + delta).clamp(0, widget.cards.length - 1);
+    if (next != _index) {
+      _controller.animateToPage(
+        next,
+        duration: const Duration(milliseconds: 250),
+        curve: Curves.easeOut,
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.cards.isEmpty) {
+      return const Scaffold(body: Center(child: Text('No cards')));
+    }
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('${widget.cards[_index].title}  (${_index + 1}/${widget.cards.length})'),
+        actions: [
+          if (widget.onEdit != null)
+            IconButton(
+              icon: const Icon(Icons.edit),
+              onPressed: () => widget.onEdit!(widget.cards[_index]),
+              tooltip: 'Edit',
+            ),
+          if (widget.onDelete != null)
+            IconButton(
+              icon: const Icon(Icons.delete),
+              onPressed: () async {
+                final current = widget.cards[_index];
+                await widget.onDelete!(current);
+                if (!mounted) return;
+                if (_index >= widget.cards.length) {
+                  Navigator.pop(context); // deck now shorter than index
+                } else {
+                  setState(() {}); // reflect deck changes
+                }
+              },
+              tooltip: 'Delete',
+            ),
+        ],
+      ),
+      body: PageView.builder(
+        controller: _controller,
+        onPageChanged: (i) => setState(() => _index = i),
+        itemCount: widget.cards.length,
+        itemBuilder: (_, i) {
+          final card = widget.cards[i];
+          return Center(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Card(
+                elevation: 6,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(16),
+                  child: SizedBox(
+                    width: 320,
+                    height: 420,
+                    child: FlipCard(
+                      front: imageFromDataUrl(card.front, fit: BoxFit.cover),
+                      back: imageFromDataUrl(card.back, fit: BoxFit.cover),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+      // (Optional) little nudge buttons in case you prefer taps over swipes
+      floatingActionButtonLocation: FloatingActionButtonLocation.centerDocked,
+      floatingActionButton: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          const SizedBox(width: 16),
+          FloatingActionButton.small(
+            onPressed: () => _go(-1),
+            child: const Icon(Icons.chevron_left),
+            heroTag: 'prev',
+          ),
+          FloatingActionButton.small(
+            onPressed: () => _go(1),
+            child: const Icon(Icons.chevron_right),
+            heroTag: 'next',
+          ),
+          const SizedBox(width: 16),
+        ],
+      ),
+    );
+  }
+}
+
