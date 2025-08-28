@@ -1,4 +1,4 @@
-name: flashcards_app
+name: flashcards_app_flutter
 description: Simple cross-platform flashcards demo (web + mobile/desktop)
 publish_to: 'none'
 version: 1.0.2+6
@@ -18,7 +18,7 @@ dependencies:
   path_provider: ^2.1.4
   flutter_file_dialog: ^3.0.0
   image: ^4.2.0
-  archive: ^3.6.1
+  archive: ^4.0.7
   path: any
 
 dev_dependencies:
