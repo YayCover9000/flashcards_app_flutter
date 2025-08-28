@@ -24,6 +24,82 @@ import 'package:flutter_file_dialog/flutter_file_dialog.dart';
 
 
 
+// NEW: stream top-level JSON array objects from a file path.
+// Works on huge files without loading the whole file in memory.
+Stream<Map<String, dynamic>> streamJsonArrayObjects(String path) async* {
+  final stream = io.File(path).openRead();
+  // We’ll scan bytes and split out top-level {...} objects safely (handles strings/escapes).
+  var buf = BytesBuilder(copy: false);
+  bool inString = false;
+  bool escape = false;
+  int depth = 0;
+  bool seenArray = false;
+
+  await for (final chunk in stream) {
+    for (final b in chunk) {
+      if (!seenArray) {
+        // skip whitespace until we see '['
+        if (b == 0x5B) { // '['
+          seenArray = true;
+        }
+        continue;
+      }
+
+      // handle string/escape state
+      if (inString) {
+        buf.addByte(b);
+        if (escape) {
+          escape = false;
+        } else if (b == 0x5C) { // '\'
+          escape = true;
+        } else if (b == 0x22) { // '"'
+          inString = false;
+        }
+        continue;
+      } else {
+        if (b == 0x22) { // '"'
+          inString = true;
+          buf.addByte(b);
+          continue;
+        }
+      }
+
+      // not in string: track object depth
+      if (b == 0x7B) { // '{'
+        depth++;
+        buf.addByte(b);
+        continue;
+      }
+      if (b == 0x7D) { // '}'
+        buf.addByte(b);
+        depth--;
+        if (depth == 0) {
+          // complete object
+          final bytes = buf.takeBytes();
+          try {
+            final obj = jsonDecode(utf8.decode(bytes));
+            if (obj is Map<String, dynamic>) yield obj;
+          } catch (_) {/* skip bad object */}
+        }
+        continue;
+      }
+
+      // if we started an object, keep bytes
+      if (depth > 0) {
+        buf.addByte(b);
+      } else {
+        // depth==0 outside of objects: watch for ']' to finish
+        if (b == 0x5D) { // ']'
+          return;
+        }
+        // skip commas/whitespace between objects
+      }
+    }
+  }
+}
+
+
+
 // Runs in a background isolate and sends batches of cards back to the UI isolate.
 void parseDeckIsolate(Map<String, dynamic> args) async {
   final send = args['send'] as SendPort;
@@ -55,12 +131,37 @@ void parseDeckIsolate(Map<String, dynamic> args) async {
       return;
     }
 
-    final raw = await io.File(path).readAsBytes();
-    final Uint8List jsonBytes = isGz
-        ? Uint8List.fromList(GZipDecoder().decodeBytes(raw))
-        : raw;
+    if (!isGz) {
+      // NEW: stream a top-level JSON array without loading the whole file.
+      int seen = 0;
+      int emitted = 0;
+      const batchSize = 200;
+      final batch = <Map<String, dynamic>>[];
 
+      await for (final obj in streamJsonArrayObjects(path)) {
+        // Validate schema only once by peeking the first object that carries meta,
+        // or accept any flashcard object. If your file has a header object instead,
+        // adapt here. For now we assume each element is a card map.
+        batch.add(obj);
+        emitted++;
+        if (batch.length >= batchSize) {
+          send.send({'type': 'batch', 'cards': List.of(batch), 'progress': null});
+          batch.clear();
+        }
+      }
+      if (batch.isNotEmpty) {
+        send.send({'type': 'batch', 'cards': List.of(batch), 'progress': 1.0});
+      }
+      send.send({'type': 'done'});
+      return;
+    }
+
+    // For .gz: NOTE the archive decoder needs full bytes; for truly huge sets,
+    // prefer .jsonl.gz and handle like JSONL above. We keep your old path:
+    final raw = await io.File(path).readAsBytes();
+    final Uint8List jsonBytes = Uint8List.fromList(GZipDecoder().decodeBytes(raw));
     final decoded = jsonDecode(utf8.decode(jsonBytes));
+
     if (decoded is! Map<String, dynamic>) throw FormatException('Invalid deck JSON (root)');
     if (decoded['schema'] != 'flashcards.simple.v1') throw FormatException('Unknown deck schema');
     final cards = decoded['cards'];
@@ -77,13 +178,12 @@ void parseDeckIsolate(Map<String, dynamic> args) async {
         batch = [];
       }
     }
-
     send.send({'type': 'done'});
+
   } catch (e, st) {
     send.send({'type': 'error', 'message': e.toString(), 'stack': st.toString()});
   }
 }
-
 
 
 
@@ -859,86 +959,33 @@ class _DeckPageState extends State<DeckPage> {
   }
 
   // -------- Export honoring Settings (ask/docs/custom) --------
-  Future<void> _exportDeck() async {
-    // Small progress dialog (non-blocking)
-    final progress = ValueNotifier<double>(0);
-    var dialogOpen = true;
-    // ignore: unawaited_futures
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (_) => WillPopScope(
-        onWillPop: () async => false,
-        child: AlertDialog(
-          title: const Text('Preparing export...'),
-          content: ValueListenableBuilder<double>(
-            valueListenable: progress,
-            builder: (_, p, __) => Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                LinearProgressIndicator(value: (p > 0 && p < 1) ? p : null),
-                const SizedBox(height: 8),
-                Text(p > 0 ? '${(p * 100).toStringAsFixed(0)} %' : 'Writing file...')
-              ],
-            ),
-          ),
-        ),
-      ),
-    ).then((_) => dialogOpen = false);
-
+// NEW: export as .jsonl (NDJSON) for big decks
+  Future<void> _exportDeckJsonl() async {
     try {
-      // File name
       final slug = _safeFileSlug(widget.deck.name);
-      final fileName = 'deck_${slug}_${DateTime.now().millisecondsSinceEpoch}.json';
+      final fileName = 'deck_${slug}_${DateTime.now().millisecondsSinceEpoch}.jsonl';
 
-      // 1) Write JSON **streaming** to a temp file (no giant in-memory string)
-      final tmpDir = await getTemporaryDirectory();
-      final tmpPath = p.join(tmpDir.path, fileName);
-      final file = io.File(tmpPath);
-      final sink = file.openWrite();
+      // stream write
+      final tmp = await getTemporaryDirectory();
+      final tmpPath = p.join(tmp.path, fileName);
+      final sink = io.File(tmpPath).openWrite();
 
-      // Write header
-      sink.write('{"schema":"flashcards.simple.v1",');
-      sink.write('"deck":{"id":');
-      sink.write(jsonEncode(widget.deck.id));
-      sink.write(',"name":');
-      sink.write(jsonEncode(widget.deck.name));
-      sink.write('},"exportedAt":');
-      sink.write(jsonEncode(DateTime.now().toIso8601String()));
-      sink.write(',"cards":[');
-
-      // Stream the cards, one by one
-      for (int i = 0; i < _cards.length; i++) {
-        final c = _cards[i];
-        // If your images can be huge, you can downscale here first (optional):
-        // final front = await downscaleDataUrl(c.front);
-        // final back  = await downscaleDataUrl(c.back);
-        final obj = {
-          "id": c.id,
-          "title": c.title,
-          "front": c.front, // or front
-          "back": c.back,   // or back
-        };
-        if (i > 0) sink.write(',');
-        sink.write(jsonEncode(obj));
-
-        // Update progress occasionally
-        if (i % 50 == 0 || i == _cards.length - 1) {
-          progress.value = _cards.isEmpty ? 1.0 : (i + 1) / _cards.length;
-          // Yield to UI a tiny bit
-          await Future<void>.delayed(const Duration(milliseconds: 1));
+      // minimal header (optional): first line can store deck meta
+      sink.writeln(jsonEncode({
+        '_meta': {
+          'schema': 'flashcards.simple.v1',
+          'deck': {'id': widget.deck.id, 'name': widget.deck.name},
+          'exportedAt': DateTime.now().toIso8601String(),
+          'format': 'jsonl'
         }
-      }
+      }));
 
-      // Close array + object, flush/close the sink
-      sink.write(']}');
+      for (final c in _cards) {
+        sink.writeln(jsonEncode(c.toJson()));
+      }
       await sink.flush();
       await sink.close();
 
-      // Close progress before opening any system UI
-      if (dialogOpen) Navigator.of(context, rootNavigator: true).pop();
-
-      // 2) Use SAF / iOS Files: user chooses where to save
       final savedPath = await FlutterFileDialog.saveFile(
         params: SaveFileDialogParams(
           sourceFilePath: tmpPath,
@@ -947,7 +994,7 @@ class _DeckPageState extends State<DeckPage> {
       );
 
       if (!mounted) return;
-      if (savedPath == null || savedPath.isEmpty) {
+      if (savedPath == null) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Export canceled')),
         );
@@ -957,12 +1004,9 @@ class _DeckPageState extends State<DeckPage> {
         );
       }
     } catch (e) {
-      if (dialogOpen) {
-        Navigator.of(context, rootNavigator: true).pop();
-      }
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Export failed: $e')),
+          SnackBar(content: Text('Export (jsonl) failed: $e')),
         );
       }
     }
@@ -1058,7 +1102,7 @@ class _DeckPageState extends State<DeckPage> {
     final rp = ReceivePort();
     await Isolate.spawn(parseDeckIsolate, {'send': rp.sendPort, 'path': path});
 
-    final imported = <FlashcardData>[];
+    int importedCount = 0;
 
     try {
       await for (final msg in rp) {
@@ -1067,13 +1111,25 @@ class _DeckPageState extends State<DeckPage> {
         switch (map['type']) {
           case 'batch':
             final list = (map['cards'] as List).cast<Map<String, dynamic>>();
+            final newCards = <FlashcardData>[];
             for (final m in list) {
               try {
                 final c = FlashcardData.fromJson(m);
                 if (c.front.startsWith('data:') && c.back.startsWith('data:')) {
-                  imported.add(c);
+                  newCards.add(c);
                 }
               } catch (_) {}
+            }
+            if (newCards.isNotEmpty) {
+              // Deduplicate vs existing
+              final ids = _cards.map((e) => e.id).toSet();
+              final toAdd = newCards.where((c) => !ids.contains(c.id)).toList();
+
+              if (toAdd.isNotEmpty) {
+                setState(() => _cards.addAll(toAdd));
+                await _save(); // persist incrementally
+                importedCount += toAdd.length;
+              }
             }
             final p = map['progress'];
             if (p is num) progress.value = p.toDouble().clamp(0.0, 1.0);
@@ -1167,15 +1223,24 @@ class _DeckPageState extends State<DeckPage> {
           IconButton(
               onPressed: _importDeck,
               tooltip: 'Import deck (.json)',
-              icon: const Icon(Icons.file_open)),
+              icon: const Icon(Icons.file_open)
+          ),
           IconButton(
               onPressed: _exportDeck,
               tooltip: 'Export deck',
-              icon: const Icon(Icons.download)),
+              icon: const Icon(Icons.download)
+          ),
+          // NEW: export JSONL button
+          IconButton(
+            onPressed: _exportDeckJsonl, // <== call your new method
+            tooltip: 'Export deck (JSONL)',
+            icon: const Icon(Icons.data_object), // you can pick another icon
+          ),
           IconButton(
               onPressed: _load,
               tooltip: 'Reload',
-              icon: const Icon(Icons.refresh)),
+              icon: const Icon(Icons.refresh)
+          ),
           IconButton(
               onPressed: _shareDeck,
               tooltip: 'Share deck',
