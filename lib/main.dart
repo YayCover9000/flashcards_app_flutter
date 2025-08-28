@@ -19,13 +19,14 @@ import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_file_dialog/flutter_file_dialog.dart';
-import 'package:flutter/painting.dart'; // for PaintingBinding.imageCache cap
 
-// NEW: stream top-level JSON array objects from a file path.
-// Works on huge files without loading the whole file in memory.
+// ============================================================================
+// [ STREAMING JSON HELPERS ] - parse huge JSON/JSONL/.gz without loading all
+// ============================================================================
+
+// Stream top-level JSON array objects from a *file path* (for .json).
 Stream<Map<String, dynamic>> streamJsonArrayObjects(String path) async* {
   final stream = io.File(path).openRead();
-  // We’ll scan bytes and split out top-level {...} objects safely (handles strings/escapes).
   var buf = BytesBuilder(copy: false);
   bool inString = false;
   bool escape = false;
@@ -35,14 +36,12 @@ Stream<Map<String, dynamic>> streamJsonArrayObjects(String path) async* {
   await for (final chunk in stream) {
     for (final b in chunk) {
       if (!seenArray) {
-        // skip whitespace until we see '['
         if (b == 0x5B) { // '['
           seenArray = true;
         }
         continue;
       }
 
-      // handle string/escape state
       if (inString) {
         buf.addByte(b);
         if (escape) {
@@ -61,7 +60,6 @@ Stream<Map<String, dynamic>> streamJsonArrayObjects(String path) async* {
         }
       }
 
-      // not in string: track object depth
       if (b == 0x7B) { // '{'
         depth++;
         buf.addByte(b);
@@ -71,7 +69,6 @@ Stream<Map<String, dynamic>> streamJsonArrayObjects(String path) async* {
         buf.addByte(b);
         depth--;
         if (depth == 0) {
-          // complete object
           final bytes = buf.takeBytes();
           try {
             final obj = jsonDecode(utf8.decode(bytes));
@@ -81,23 +78,21 @@ Stream<Map<String, dynamic>> streamJsonArrayObjects(String path) async* {
         continue;
       }
 
-      // if we started an object, keep bytes
       if (depth > 0) {
         buf.addByte(b);
       } else {
-        // depth==0 outside of objects: watch for ']' to finish
         if (b == 0x5D) { // ']'
           return;
         }
-        // skip commas/whitespace between objects
       }
     }
   }
 }
 
-// Stream top-level JSON array objects from a *byte stream* (works for .json and .json.gz)
+// Stream top-level JSON array objects from a *byte stream* (.json or .json.gz).
 Stream<Map<String, dynamic>> streamJsonArrayObjectsFromStream(
-    Stream<List<int>> byteStream) async* {
+    Stream<List<int>> byteStream,
+    ) async* {
   var buf = BytesBuilder(copy: false);
   bool inString = false, escape = false, seenArray = false;
   int depth = 0;
@@ -141,12 +136,12 @@ Stream<Map<String, dynamic>> streamJsonArrayObjectsFromStream(
         buf.addByte(b);
       } else {
         if (b == 0x5D) return; // ']'
-        // skip commas/whitespace
       }
     }
   }
 }
 
+// Background isolate: reads .json/.json.gz (top-level array) or .jsonl/.jsonl.gz.
 void parseDeckIsolate(Map<String, dynamic> args) async {
   final send = args['send'] as SendPort;
   final path = args['path'] as String;
@@ -159,15 +154,15 @@ void parseDeckIsolate(Map<String, dynamic> args) async {
         lower.endsWith('.ndjson') ||
         lower.endsWith('.ndjson.gz');
 
-    // Open file as a byte stream; if gz, transparently decompress
     Stream<List<int>> openBytes() {
       final s = io.File(path).openRead();
       return isGz ? s.transform(io.gzip.decoder) : s; // gzip from dart:io
     }
 
     if (isJsonl) {
-      final textLines =
-      openBytes().transform(utf8.decoder).transform(const LineSplitter());
+      final textLines = openBytes()
+          .transform(utf8.decoder)
+          .transform(const LineSplitter());
       const batchSize = 100;
       final batch = <Map<String, dynamic>>[];
 
@@ -177,38 +172,33 @@ void parseDeckIsolate(Map<String, dynamic> args) async {
           if (obj is Map<String, dynamic>) batch.add(obj);
         } catch (_) {}
         if (batch.length >= batchSize) {
-          send.send(
-              {'type': 'batch', 'cards': List.of(batch), 'progress': null});
+          send.send({'type': 'batch', 'cards': List.of(batch), 'progress': null});
           batch.clear();
         }
       }
       if (batch.isNotEmpty) {
-        send.send(
-            {'type': 'batch', 'cards': List.of(batch), 'progress': 1.0});
+        send.send({'type': 'batch', 'cards': List.of(batch), 'progress': 1.0});
       }
       send.send({'type': 'done'});
       return;
     }
 
-    // Stream a top-level JSON *array* (.json or .json.gz)
+    // Stream a top-level JSON array (.json or .json.gz)
     const batchSize = 200;
     final batch = <Map<String, dynamic>>[];
     await for (final obj in streamJsonArrayObjectsFromStream(openBytes())) {
       batch.add(obj);
       if (batch.length >= batchSize) {
-        send.send(
-            {'type': 'batch', 'cards': List.of(batch), 'progress': null});
+        send.send({'type': 'batch', 'cards': List.of(batch), 'progress': null});
         batch.clear();
       }
     }
     if (batch.isNotEmpty) {
-      send.send(
-          {'type': 'batch', 'cards': List.of(batch), 'progress': 1.0});
+      send.send({'type': 'batch', 'cards': List.of(batch), 'progress': 1.0});
     }
     send.send({'type': 'done'});
   } catch (e, st) {
-    send.send(
-        {'type': 'error', 'message': e.toString(), 'stack': st.toString()});
+    send.send({'type': 'error', 'message': e.toString(), 'stack': st.toString()});
   }
 }
 
@@ -219,8 +209,8 @@ void parseDeckIsolate(Map<String, dynamic> args) async {
 enum ExportLocationMode { askEveryTime, appDocuments, customFolder }
 
 class AppSettings extends ChangeNotifier {
-  static const _kThemeKey = 'settings_theme_mode_v1'; // 0=system,1=light,2=dark
-  static const _kExportModeKey = 'settings_export_mode_v1'; // 0=ask,1=docs,2=custom
+  static const _kThemeKey = 'settings_theme_mode_v1';         // 0=system,1=light,2=dark
+  static const _kExportModeKey = 'settings_export_mode_v1';   // 0=ask,1=docs,2=custom
   static const _kCustomDirKey = 'settings_export_custom_dir_v1';
 
   int _themeIdx = 0;
@@ -276,7 +266,6 @@ class AppSettings extends ChangeNotifier {
   }
 }
 
-/// Simple inherited holder so the whole widget tree can read settings.
 class SettingsScope extends InheritedWidget {
   final AppSettings settings;
   const SettingsScope({super.key, required this.settings, required super.child});
@@ -292,6 +281,7 @@ class SettingsScope extends InheritedWidget {
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // OK via material.dart re-export; no extra import needed.
   PaintingBinding.instance.imageCache.maximumSizeBytes = 120 * 1024 * 1024;
   final settings = await AppSettings.load();
   runApp(MyApp(settings: settings));
@@ -438,10 +428,12 @@ Future<String> _persistDataUrlToFile(
   }
   final w = decoded.width, h = decoded.height;
   final resized = (w > maxDim || h > maxDim)
-      ? img.copyResize(decoded,
-      width: w >= h ? maxDim : null,
-      height: h > w ? maxDim : null,
-      interpolation: img.Interpolation.average)
+      ? img.copyResize(
+    decoded,
+    width: w >= h ? maxDim : null,
+    height: h > w ? maxDim : null,
+    interpolation: img.Interpolation.average,
+  )
       : decoded;
   final outJpg = img.encodeJpg(resized, quality: jpegQuality);
   final path = p.join(dir.path, '$nameBase.jpg');
@@ -486,22 +478,17 @@ Widget imageFromSource(String src,
 
 /// Make a safe filename fragment from a deck name (works on Windows/macOS/Linux).
 String _safeFileSlug(String input) {
-  // Replace characters invalid on Windows: < > : " / \ | ? *  and control chars
   var s = input.replaceAll(RegExp(r'[<>:"/\\|?*]'), '_');
-  // Collapse whitespace to single underscores
   s = s.replaceAll(RegExp(r'\s+'), '_');
-  // Remove trailing dots/spaces (illegal on Windows)
   s = s.replaceAll(RegExp(r'[ .]+$'), '');
-  // Collapse multiple underscores
   s = s.replaceAll(RegExp(r'_+'), '_');
   if (s.isEmpty) s = 'deck';
-  if (s.length > 60) s = s.substring(0, 60); // keep it neat
+  if (s.length > 60) s = s.substring(0, 60);
   return s;
 }
 
 Future<String?> pickImageAsDataUrl(BuildContext context,
     {required String hint}) async {
-  // Mobile/desktop chooser
   if (!kIsWeb) {
     final source = await showDialog<ImageSource>(
       context: context,
@@ -529,8 +516,7 @@ Future<String?> pickImageAsDataUrl(BuildContext context,
 
     if (source != null) {
       final picker = ImagePicker();
-      final picked = await picker.pickImage(
-          source: source, imageQuality: 85);
+      final picked = await picker.pickImage(source: source, imageQuality: 85);
       if (picked != null) {
         final bytes = await picked.readAsBytes();
         final mime = _guessMimeFromName(picked.name);
@@ -539,10 +525,9 @@ Future<String?> pickImageAsDataUrl(BuildContext context,
     }
   }
 
-  // Web or fallback via file picker
   try {
-    final result = await FilePicker.platform
-        .pickFiles(type: FileType.image, withData: true);
+    final result =
+    await FilePicker.platform.pickFiles(type: FileType.image, withData: true);
     if (result == null || result.files.isEmpty) return null;
     final file = result.files.first;
     if (file.bytes == null) return null;
@@ -550,8 +535,8 @@ Future<String?> pickImageAsDataUrl(BuildContext context,
     return _bytesToDataUrl(file.bytes!, mime: mime);
   } catch (e) {
     if (context.mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to pick file: $e')));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('Failed to pick file: $e')));
     }
     return null;
   }
@@ -577,12 +562,12 @@ Future<String> downscaleDataUrl(String dataUrl,
     final b64 = base64Encode(out);
     return 'data:image/jpeg;base64,$b64';
   } catch (_) {
-    return dataUrl; // fall back if anything fails
+    return dataUrl;
   }
 }
 
 // ============================================================================
-// [ STORAGE ] - SharedPreferences for decks + cards
+// [ STORAGE ] - SharedPreferences for decks + cards (metadata & paths/urls)
 // ============================================================================
 
 class Store {
@@ -607,20 +592,20 @@ class Store {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getStringList(cardsKey(deckId)) ?? [];
     return raw
-        .map((s) => FlashcardData.fromJson(jsonDecode(s) as Map<String, dynamic>))
+        .map((s) =>
+        FlashcardData.fromJson(jsonDecode(s) as Map<String, dynamic>))
         .toList();
   }
 
-  static Future<void> saveCards(
-      String deckId, List<FlashcardData> cards) async {
+  static Future<void> saveCards(String deckId, List<FlashcardData> cards) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setStringList(cardsKey(deckId),
-        cards.map((c) => jsonEncode(c.toJson())).toList());
+    await prefs.setStringList(
+        cardsKey(deckId), cards.map((c) => jsonEncode(c.toJson())).toList());
   }
 }
 
 // ============================================================================
-// [ SETTINGS PAGE ] - theme + export location options wheel
+// [ SETTINGS PAGE ] - theme + export location options (RadioGroup!)
 // ============================================================================
 
 class SettingsPage extends StatefulWidget {
@@ -640,73 +625,71 @@ class _SettingsPageState extends State<SettingsPage> {
       body: ListView(
         children: [
           const ListTile(title: Text('Appearance'), subtitle: Text('Theme')),
-          RadioListTile<int>(
-            value: 0,
+          // New RadioGroup API: manages groupValue and onChanged.
+          RadioGroup<int>(
             groupValue: s.themeIdx,
-            onChanged: (v) => setState(() => s.themeIdx = v!),
-            title: const Text('System'),
+            onChanged: (v) => setState(() => s.themeIdx = v ?? s.themeIdx),
+            child: Column(
+              children: const [
+                RadioListTile<int>(value: 0, title: Text('System')),
+                RadioListTile<int>(value: 1, title: Text('Light')),
+                RadioListTile<int>(value: 2, title: Text('Dark')),
+              ],
+            ),
           ),
-          RadioListTile<int>(
-            value: 1,
-            groupValue: s.themeIdx,
-            onChanged: (v) => setState(() => s.themeIdx = v!),
-            title: const Text('Light'),
-          ),
-          RadioListTile<int>(
-            value: 2,
-            groupValue: s.themeIdx,
-            onChanged: (v) => setState(() => s.themeIdx = v!),
-            title: const Text('Dark'),
-          ),
+
           const Divider(),
           const ListTile(
             title: Text('Export'),
             subtitle: Text('Where to save deck JSON'),
           ),
-          RadioListTile<int>(
-            value: 0,
+          RadioGroup<int>(
             groupValue: s.exportIdx,
-            onChanged: (v) => setState(() => s.exportIdx = v!),
-            title: const Text('Ask every time'),
-            subtitle: const Text('Pick a folder on export'),
-          ),
-          RadioListTile<int>(
-            value: 1,
-            groupValue: s.exportIdx,
-            onChanged: (v) => setState(() => s.exportIdx = v!),
-            title: const Text('App Documents'),
-            subtitle: const Text('Saves under the app’s documents directory'),
-          ),
-          RadioListTile<int>(
-            value: 2,
-            groupValue: s.exportIdx,
-            onChanged: (v) => setState(() => s.exportIdx = v!),
-            title: const Text('Custom folder'),
-            subtitle: Text(s.customDir?.isNotEmpty == true
-                ? s.customDir!
-                : 'Not set'),
-            secondary: _picking
-                ? const SizedBox(
-                width: 24,
-                height: 24,
-                child: CircularProgressIndicator(strokeWidth: 2))
-                : IconButton(
-              tooltip: 'Choose folder',
-              icon: const Icon(Icons.folder_open),
-              onPressed: () async {
-                setState(() => _picking = true);
-                try {
-                  final dir =
-                  await FilePicker.platform.getDirectoryPath(
-                      dialogTitle: 'Choose export folder');
-                  if (dir != null) {
-                    s.customDir = dir;
-                    s.exportIdx = 2;
-                  }
-                } finally {
-                  if (mounted) setState(() => _picking = false);
-                }
-              },
+            onChanged: (v) => setState(() => s.exportIdx = v ?? s.exportIdx),
+            child: Column(
+              children: [
+                const RadioListTile<int>(
+                  value: 0,
+                  title: Text('Ask every time'),
+                  subtitle: Text('Pick a folder on export'),
+                ),
+                const RadioListTile<int>(
+                  value: 1,
+                  title: Text('App Documents'),
+                  subtitle: Text('Saves under the app’s documents directory'),
+                ),
+                RadioListTile<int>(
+                  value: 2,
+                  title: const Text('Custom folder'),
+                  subtitle: Text(
+                    s.customDir?.isNotEmpty == true ? s.customDir! : 'Not set',
+                  ),
+                  secondary: _picking
+                      ? const SizedBox(
+                    width: 24,
+                    height: 24,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                      : IconButton(
+                    tooltip: 'Choose folder',
+                    icon: const Icon(Icons.folder_open),
+                    onPressed: () async {
+                      setState(() => _picking = true);
+                      try {
+                        final dir = await FilePicker.platform
+                            .getDirectoryPath(
+                            dialogTitle: 'Choose export folder');
+                        if (dir != null) {
+                          s.customDir = dir;
+                          s.exportIdx = 2;
+                        }
+                      } finally {
+                        if (mounted) setState(() => _picking = false);
+                      }
+                    },
+                  ),
+                ),
+              ],
             ),
           ),
           const Padding(
@@ -835,8 +818,8 @@ class _DeckListPageState extends State<DeckListPage> {
           IconButton(
             tooltip: 'Settings',
             icon: const Icon(Icons.settings),
-            onPressed: () => Navigator.of(context)
-                .push(MaterialPageRoute(builder: (_) => const SettingsPage())),
+            onPressed: () => Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const SettingsPage())),
           ),
         ],
       ),
@@ -913,7 +896,6 @@ class _DeckPageState extends State<DeckPage> {
     _load();
   }
 
-  // In _DeckPageState
   Widget _gridTile(FlashcardData card, int index) {
     return Card(
       elevation: 2,
@@ -923,9 +905,9 @@ class _DeckPageState extends State<DeckPage> {
         onTap: () => Navigator.of(context).push(
           MaterialPageRoute(
             builder: (_) => SwipeViewerPage(
-              cards: _cards, // pass the list
-              initialIndex: index, // start at tapped card
-              onEdit: (c) => _edit(c), // keep your edit/delete actions
+              cards: _cards,
+              initialIndex: index,
+              onEdit: (c) => _edit(c),
               onDelete: (c) => _delete(c),
             ),
           ),
@@ -976,7 +958,6 @@ class _DeckPageState extends State<DeckPage> {
     final created = await Navigator.of(context).push<FlashcardData?>(
         MaterialPageRoute(builder: (_) => const EditFlashcardPage()));
     if (created != null) {
-      // Persist images to files and store paths
       final dir = await _deckDir(widget.deck.id);
       final frontPath = created.front.startsWith('data:')
           ? await _persistDataUrlToFile(
@@ -1068,7 +1049,7 @@ class _DeckPageState extends State<DeckPage> {
     }
   }
 
-  // --- Export current deck as a portable .json file (rehydrates data URLs) ---
+  // --- Export: Portable .json (rehydrates images to data URLs) ---
   Future<void> _exportDeck() async {
     try {
       final cardsJson = <Map<String, dynamic>>[];
@@ -1089,7 +1070,6 @@ class _DeckPageState extends State<DeckPage> {
       final fileName =
           'deck_${slug}_${DateTime.now().millisecondsSinceEpoch}.json';
 
-      // write to a temp file then let user pick destination
       final tmp = await getTemporaryDirectory();
       final tmpPath = p.join(tmp.path, fileName);
       await io.File(tmpPath).writeAsString(jsonStr);
@@ -1102,26 +1082,18 @@ class _DeckPageState extends State<DeckPage> {
       );
 
       if (!mounted) return;
-      if (savedPath == null) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Export canceled')),
-        );
-      } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Saved to: $savedPath')),
-        );
-      }
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content:
+          Text(savedPath == null ? 'Export canceled' : 'Saved to: $savedPath')));
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Export failed: $e')),
-        );
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Export failed: $e')));
       }
     }
   }
 
-  // --- Export JSONL (NDJSON). This version writes local paths (small/fast).
-  // Use _exportDeck() above for a portable JSON with embedded data URLs.
+  // --- Export: NDJSON (.jsonl) portable stream (header + 1 card per line) ---
   Future<void> _exportDeckJsonl() async {
     try {
       final slug = _safeFileSlug(widget.deck.name);
@@ -1132,7 +1104,7 @@ class _DeckPageState extends State<DeckPage> {
       final tmpPath = p.join(tmp.path, fileName);
       final sink = io.File(tmpPath).openWrite();
 
-      // Optional meta header as first line
+      // Minimal header/meta on first line
       sink.writeln(jsonEncode({
         '_meta': {
           'schema': 'flashcards.simple.v1',
@@ -1143,9 +1115,8 @@ class _DeckPageState extends State<DeckPage> {
       }));
 
       for (final c in _cards) {
-        sink.writeln(jsonEncode(c.toJson())); // fast, path-based
-        // For portable JSONL, replace with:
-        // sink.writeln(jsonEncode(await _cardToPortableJson(c)));
+        final portable = await _cardToPortableJson(c);
+        sink.writeln(jsonEncode(portable));
       }
       await sink.flush();
       await sink.close();
@@ -1158,19 +1129,18 @@ class _DeckPageState extends State<DeckPage> {
       );
 
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(savedPath == null ? 'Export canceled' : 'Saved to: $savedPath')),
-      );
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content:
+          Text(savedPath == null ? 'Export canceled' : 'Saved to: $savedPath')));
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Export (JSONL) failed: $e')),
-        );
+            SnackBar(content: Text('Export (jsonl) failed: $e')));
       }
     }
   }
 
-  // --- Share current deck as a .json file (rehydrates to data URLs) ---
+  // --- Share current deck (.json) using new share_plus API ---
   Future<void> _shareDeck() async {
     try {
       final cardsJson = <Map<String, dynamic>>[];
@@ -1189,34 +1159,28 @@ class _DeckPageState extends State<DeckPage> {
       final fileName =
           'deck_${slug}_${DateTime.now().millisecondsSinceEpoch}.json';
 
-      // write to a temp file so share targets can read it
       final tmp = await getTemporaryDirectory();
       final path = p.join(tmp.path, fileName);
       await io.File(path).writeAsString(jsonStr);
 
-      // share the file (no extra deps besides share_plus)
-      await Share.shareXFiles(
-        [XFile(path, mimeType: 'application/json', name: fileName)],
+      await SharePlus.instance.share(ShareParams(
+        files: [XFile(path, mimeType: 'application/json', name: fileName)],
         subject: fileName,
         text: 'Flashcards deck: ${widget.deck.name}',
-      );
+      ));
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Share failed: $e')),
-        );
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Share failed: $e')));
       }
     }
   }
 
-  // ========================================================================
-  // [ DECK PAGE ] -  import
-  // ========================================================================
-
+  // --- Import: supports .json (array), .jsonl and .json/.jsonl.gz ---
   Future<void> _importDeck() async {
     final res = await FilePicker.platform.pickFiles(
       type: FileType.custom,
-      // Include 'gz' to allow .json.gz / .jsonl.gz (FilePicker matches final extension)
+      // Use 'gz' to allow .json.gz / .jsonl.gz (FilePicker matches last extension)
       allowedExtensions: ['json', 'jsonl', 'gz', 'deckjson'],
       withData: false,
     );
@@ -1225,21 +1189,20 @@ class _DeckPageState extends State<DeckPage> {
     final path = res.files.single.path;
     if (path == null) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('No file path available')),
-        );
+        ScaffoldMessenger.of(context)
+            .showSnackBar(const SnackBar(content: Text('No file path available')));
       }
       return;
     }
 
-    // Progress dialog
+    // Progress dialog (PopScope replaces WillPopScope)
     final progress = ValueNotifier<double?>(null);
     bool dialogOpen = true;
     showDialog(
       context: context,
       barrierDismissible: false,
-      builder: (_) => WillPopScope(
-        onWillPop: () async => false,
+      builder: (_) => PopScope(
+        canPop: false,
         child: AlertDialog(
           title: const Text('Importing deck...'),
           content: ValueListenableBuilder<double?>(
@@ -1268,8 +1231,7 @@ class _DeckPageState extends State<DeckPage> {
         final map = msg.cast<String, dynamic>();
         switch (map['type']) {
           case 'batch':
-            final list =
-            (map['cards'] as List).cast<Map<String, dynamic>>();
+            final list = (map['cards'] as List).cast<Map<String, dynamic>>();
             final dir = await _deckDir(widget.deck.id);
 
             final toAdd = <FlashcardData>[];
@@ -1292,8 +1254,7 @@ class _DeckPageState extends State<DeckPage> {
 
             if (toAdd.isNotEmpty) {
               final ids = _cards.map((e) => e.id).toSet();
-              final unique =
-              toAdd.where((c) => !ids.contains(c.id)).toList();
+              final unique = toAdd.where((c) => !ids.contains(c.id)).toList();
               if (unique.isNotEmpty) {
                 setState(() => _cards.addAll(unique));
                 await _save();
@@ -1324,9 +1285,8 @@ class _DeckPageState extends State<DeckPage> {
     } catch (e) {
       if (dialogOpen) Navigator.of(context, rootNavigator: true).pop();
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Import failed: $e')),
-        );
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Import failed: $e')));
       }
     }
   }
@@ -1357,7 +1317,7 @@ class _DeckPageState extends State<DeckPage> {
         itemCount: _cards.length,
         gridDelegate:
         const SliverGridDelegateWithMaxCrossAxisExtent(
-          maxCrossAxisExtent: 220, // smaller tiles, more per row
+          maxCrossAxisExtent: 220,
           mainAxisSpacing: 12,
           crossAxisSpacing: 12,
           childAspectRatio: 0.72,
@@ -1371,22 +1331,25 @@ class _DeckPageState extends State<DeckPage> {
         title: Text(widget.deck.name),
         actions: [
           IconButton(
-              onPressed: _importDeck,
-              tooltip: 'Import deck (.json / .jsonl / .gz)',
-              icon: const Icon(Icons.file_open)),
+            onPressed: _importDeck,
+            tooltip: 'Import deck (.json/.jsonl/.gz)',
+            icon: const Icon(Icons.file_open),
+          ),
           IconButton(
-              onPressed: _exportDeck,
-              tooltip: 'Export deck (portable JSON)',
-              icon: const Icon(Icons.download)),
+            onPressed: _exportDeck,
+            tooltip: 'Export deck (.json)',
+            icon: const Icon(Icons.download),
+          ),
           IconButton(
             onPressed: _exportDeckJsonl,
-            tooltip: 'Export deck (JSONL, fast local)',
+            tooltip: 'Export deck (JSONL)',
             icon: const Icon(Icons.data_object),
           ),
           IconButton(
-              onPressed: _load,
-              tooltip: 'Reload',
-              icon: const Icon(Icons.refresh)),
+            onPressed: _load,
+            tooltip: 'Reload',
+            icon: const Icon(Icons.refresh),
+          ),
           IconButton(
             onPressed: _shareDeck,
             tooltip: 'Share deck',
@@ -1396,9 +1359,7 @@ class _DeckPageState extends State<DeckPage> {
       ),
       body: body,
       floatingActionButton: FloatingActionButton.extended(
-          onPressed: _create,
-          icon: const Icon(Icons.add),
-          label: const Text('New Card')),
+          onPressed: _create, icon: const Icon(Icons.add), label: const Text('New Card')),
     );
   }
 }
@@ -1471,7 +1432,8 @@ class _EditFlashcardPageState extends State<EditFlashcardPage> {
   Widget build(BuildContext context) {
     final isEditing = widget.existing != null;
     return Scaffold(
-      appBar: AppBar(title: Text(isEditing ? 'Edit Card' : 'Create Card')),
+      appBar:
+      AppBar(title: Text(isEditing ? 'Edit Card' : 'Create Card')),
       body: Padding(
         padding: const EdgeInsets.all(12),
         child: Column(children: [
@@ -1529,8 +1491,9 @@ class _EditFlashcardPageState extends State<EditFlashcardPage> {
                 child: ElevatedButton.icon(
                     onPressed: _saving ? null : _save,
                     icon: const Icon(Icons.save),
-                    label: Text(
-                        _saving ? 'Saving...' : (isEditing ? 'Save changes' : 'Create card')))),
+                    label: Text(_saving
+                        ? 'Saving...'
+                        : (isEditing ? 'Save changes' : 'Create card')))),
           ])
         ]),
       ),
@@ -1547,7 +1510,10 @@ class ViewFlashcardPage extends StatelessWidget {
   final VoidCallback onEdit;
   final VoidCallback onDelete;
   const ViewFlashcardPage(
-      {super.key, required this.card, required this.onEdit, required this.onDelete});
+      {super.key,
+        required this.card,
+        required this.onEdit,
+        required this.onDelete});
 
   @override
   Widget build(BuildContext context) {
@@ -1585,6 +1551,10 @@ class ViewFlashcardPage extends StatelessWidget {
     );
   }
 }
+
+// ============================================================================
+// [ SWIPE VIEWER PAGE ] - horizontal swipe between cards
+// ============================================================================
 
 class SwipeViewerPage extends StatefulWidget {
   final List<FlashcardData> cards;
@@ -1640,7 +1610,8 @@ class _SwipeViewerPageState extends State<SwipeViewerPage> {
 
     return Scaffold(
       appBar: AppBar(
-        title: Text('${widget.cards[_index].title}  (${_index + 1}/${widget.cards.length})'),
+        title: Text(
+            '${widget.cards[_index].title}  (${_index + 1}/${widget.cards.length})'),
         actions: [
           if (widget.onEdit != null)
             IconButton(
@@ -1656,7 +1627,7 @@ class _SwipeViewerPageState extends State<SwipeViewerPage> {
                 await widget.onDelete!(current);
                 if (!mounted) return;
                 if (_index >= widget.cards.length) {
-                  Navigator.pop(context); // deck now shorter than index
+                  Navigator.pop(context);
                 } else {
                   setState(() {}); // reflect deck changes
                 }
@@ -1694,7 +1665,6 @@ class _SwipeViewerPageState extends State<SwipeViewerPage> {
           );
         },
       ),
-      // (Optional) little nudge buttons in case you prefer taps over swipes
       floatingActionButtonLocation: FloatingActionButtonLocation.centerDocked,
       floatingActionButton: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
