@@ -5,12 +5,12 @@
 
 import 'dart:convert'
     show jsonDecode, jsonEncode, JsonEncoder, utf8, LineSplitter,
-    base64Decode, base64Encode, gzip;
-import 'dart:convert' as convert show gzip;
+    base64Decode, base64Encode;
 import 'dart:isolate';
 import 'dart:typed_data';
 import 'dart:io' as io;
 
+import 'package:cross_file/cross_file.dart' as xfile;
 import 'package:file_picker/file_picker.dart';
 import 'package:flip_card/flip_card.dart';
 import 'package:flutter/foundation.dart';
@@ -22,6 +22,11 @@ import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_file_dialog/flutter_file_dialog.dart';
+
+// ---------- Enums must be top-level in Dart ----------
+enum _DeckListMenu { newDeck, settings }
+enum _DeckMenu { study, import, exportJson, exportJsonl, share, reload }
+enum _SwipeMenu { edit, delete }
 
 // ============================================================================
 // [ STREAMING JSON HELPERS ] - parse huge JSON/JSONL/.gz without loading all
@@ -159,6 +164,7 @@ void parseDeckIsolate(Map<String, dynamic> args) async {
 
     Stream<List<int>> openBytes() {
       final s = io.File(path).openRead();
+      // Use GZipCodec from dart:io
       return isGz ? s.transform(io.GZipCodec().decoder) : s;
     }
 
@@ -284,7 +290,6 @@ class SettingsScope extends InheritedWidget {
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  PaintingBinding.instance.imageCache.maximumSizeBytes = 120 * 1024 * 1024;
   final settings = await AppSettings.load();
   runApp(MyApp(settings: settings));
 }
@@ -599,17 +604,13 @@ Uint8List _dataUrlToBytes(String dataUrl) {
   return base64Decode(dataUrl.substring(idx + 1));
 }
 
-Widget imageFromSource(String src,
-    {BoxFit fit = BoxFit.cover, int? cacheWidth}) {
+Widget imageFromSource(String src, {BoxFit fit = BoxFit.cover, int? cacheWidth}) {
   if (src.startsWith('data:')) {
     final bytes = _dataUrlToBytes(src);
-    return Image.memory(bytes,
-        fit: fit, gaplessPlayback: true, cacheWidth: cacheWidth);
+    return Image.memory(bytes, fit: fit, gaplessPlayback: true, cacheWidth: cacheWidth);
   }
-  final filePath =
-  src.startsWith('file://') ? io.File.fromUri(Uri.parse(src)).path : src;
-  return Image.file(io.File(filePath),
-      fit: fit, gaplessPlayback: true, cacheWidth: cacheWidth);
+  final filePath = src.startsWith('file://') ? io.File.fromUri(Uri.parse(src)).path : src;
+  return Image.file(io.File(filePath), fit: fit, gaplessPlayback: true, cacheWidth: cacheWidth);
 }
 
 /// Make a safe filename fragment from a deck name (works on Windows/macOS/Linux).
@@ -623,8 +624,7 @@ String _safeFileSlug(String input) {
   return s;
 }
 
-Future<String?> pickImageAsDataUrl(BuildContext context,
-    {required String hint}) async {
+Future<String?> pickImageAsDataUrl(BuildContext context, {required String hint}) async {
   if (!kIsWeb) {
     final source = await showDialog<ImageSource>(
       context: context,
@@ -662,8 +662,7 @@ Future<String?> pickImageAsDataUrl(BuildContext context,
   }
 
   try {
-    final result =
-    await FilePicker.platform.pickFiles(type: FileType.image, withData: true);
+    final result = await FilePicker.platform.pickFiles(type: FileType.image, withData: true);
     if (result == null || result.files.isEmpty) return null;
     final file = result.files.first;
     if (file.bytes == null) return null;
@@ -678,8 +677,7 @@ Future<String?> pickImageAsDataUrl(BuildContext context,
   }
 }
 
-Future<String> downscaleDataUrl(String dataUrl,
-    {int maxDim = 1280, int jpegQuality = 80}) async {
+Future<String> downscaleDataUrl(String dataUrl, {int maxDim = 1280, int jpegQuality = 80}) async {
   try {
     final comma = dataUrl.indexOf(',');
     if (comma < 0) return dataUrl;
@@ -728,8 +726,7 @@ class Store {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getStringList(cardsKey(deckId)) ?? [];
     return raw
-        .map((s) =>
-        FlashcardData.fromJson(jsonDecode(s) as Map<String, dynamic>))
+        .map((s) => FlashcardData.fromJson(jsonDecode(s) as Map<String, dynamic>))
         .toList();
   }
 
@@ -741,7 +738,7 @@ class Store {
 }
 
 // ============================================================================
-// [ SETTINGS PAGE ] - (kept simple; deprecation warnings are harmless)
+// [ SETTINGS PAGE ] - compact, safe (no overflow)
 // ============================================================================
 
 class SettingsPage extends StatefulWidget {
@@ -803,13 +800,10 @@ class _SettingsPageState extends State<SettingsPage> {
             groupValue: s.exportIdx,
             onChanged: (v) => setState(() => s.exportIdx = v!),
             title: const Text('Custom folder'),
-            subtitle: Text(s.customDir?.isNotEmpty == true
-                ? s.customDir!
-                : 'Not set'),
+            subtitle: Text(s.customDir?.isNotEmpty == true ? s.customDir! : 'Not set'),
             secondary: _picking
                 ? const SizedBox(
-                width: 24,
-                height: 24,
+                width: 24, height: 24,
                 child: CircularProgressIndicator(strokeWidth: 2))
                 : IconButton(
               tooltip: 'Choose folder',
@@ -844,7 +838,7 @@ class _SettingsPageState extends State<SettingsPage> {
 }
 
 // ============================================================================
-// [ DECK LIST PAGE ] - folders (create/rename/delete) + open Settings
+// [ DECK LIST PAGE ] - folders (create/rename/delete) + Settings (menu)
 // ============================================================================
 
 class DeckListPage extends StatefulWidget {
@@ -876,22 +870,19 @@ class _DeckListPageState extends State<DeckListPage> {
       builder: (ctx) => AlertDialog(
         title: const Text('New Deck'),
         content: TextField(
-            controller: controller,
-            decoration: const InputDecoration(labelText: 'Deck name')),
+          controller: controller,
+          decoration: const InputDecoration(labelText: 'Deck name'),
+        ),
         actions: [
-          TextButton(
-              onPressed: () => Navigator.of(ctx).pop(),
+          TextButton(onPressed: () => Navigator.of(ctx).pop(),
               child: const Text('Cancel')),
-          TextButton(
-              onPressed: () =>
-                  Navigator.of(ctx).pop(controller.text.trim()),
+          TextButton(onPressed: () => Navigator.of(ctx).pop(controller.text.trim()),
               child: const Text('Create')),
         ],
       ),
     );
     if (name == null || name.isEmpty) return;
-    final deck = DeckMeta(
-        id: DateTime.now().millisecondsSinceEpoch.toString(), name: name);
+    final deck = DeckMeta(id: DateTime.now().millisecondsSinceEpoch.toString(), name: name);
     setState(() => _decks.add(deck));
     await Store.saveDecks(_decks);
   }
@@ -903,15 +894,13 @@ class _DeckListPageState extends State<DeckListPage> {
       builder: (ctx) => AlertDialog(
         title: const Text('Rename Deck'),
         content: TextField(
-            controller: controller,
-            decoration: const InputDecoration(labelText: 'Deck name')),
+          controller: controller,
+          decoration: const InputDecoration(labelText: 'Deck name'),
+        ),
         actions: [
-          TextButton(
-              onPressed: () => Navigator.of(ctx).pop(),
+          TextButton(onPressed: () => Navigator.of(ctx).pop(),
               child: const Text('Cancel')),
-          TextButton(
-              onPressed: () =>
-                  Navigator.of(ctx).pop(controller.text.trim()),
+          TextButton(onPressed: () => Navigator.of(ctx).pop(controller.text.trim()),
               child: const Text('Save')),
         ],
       ),
@@ -931,11 +920,9 @@ class _DeckListPageState extends State<DeckListPage> {
         title: const Text('Delete deck?'),
         content: Text('This deletes deck "${deck.name}" and its cards.'),
         actions: [
-          TextButton(
-              onPressed: () => Navigator.of(ctx).pop(false),
+          TextButton(onPressed: () => Navigator.of(ctx).pop(false),
               child: const Text('Cancel')),
-          TextButton(
-              onPressed: () => Navigator.of(ctx).pop(true),
+          TextButton(onPressed: () => Navigator.of(ctx).pop(true),
               child: const Text('Delete')),
         ],
       ),
@@ -952,11 +939,36 @@ class _DeckListPageState extends State<DeckListPage> {
       appBar: AppBar(
         title: const Text('My Decks'),
         actions: [
-          IconButton(
-            tooltip: 'Settings',
-            icon: const Icon(Icons.settings),
-            onPressed: () => Navigator.of(context).push(
-                MaterialPageRoute(builder: (_) => const SettingsPage())),
+          PopupMenuButton<_DeckListMenu>(
+            icon: const Icon(Icons.more_vert),
+            onSelected: (m) {
+              switch (m) {
+                case _DeckListMenu.newDeck:
+                  _createDeck();
+                  break;
+                case _DeckListMenu.settings:
+                  Navigator.of(context).push(
+                    MaterialPageRoute(builder: (_) => const SettingsPage()),
+                  );
+                  break;
+              }
+            },
+            itemBuilder: (ctx) => const [
+              PopupMenuItem(
+                value: _DeckListMenu.newDeck,
+                child: ListTile(
+                  leading: Icon(Icons.create_new_folder),
+                  title: Text('New Deck'),
+                ),
+              ),
+              PopupMenuItem(
+                value: _DeckListMenu.settings,
+                child: ListTile(
+                  leading: Icon(Icons.settings),
+                  title: Text('Settings'),
+                ),
+              ),
+            ],
           ),
         ],
       ),
@@ -965,18 +977,19 @@ class _DeckListPageState extends State<DeckListPage> {
           : _decks.isEmpty
           ? Center(
         child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              const Icon(Icons.folder_open,
-                  size: 90, color: Colors.grey),
-              const SizedBox(height: 8),
-              const Text('No decks yet'),
-              const SizedBox(height: 8),
-              ElevatedButton.icon(
-                  onPressed: _createDeck,
-                  icon: const Icon(Icons.add),
-                  label: const Text('Create your first deck')),
-            ]),
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.folder_open, size: 90, color: Colors.grey),
+            const SizedBox(height: 8),
+            const Text('No decks yet'),
+            const SizedBox(height: 8),
+            ElevatedButton.icon(
+              onPressed: _createDeck,
+              icon: const Icon(Icons.add),
+              label: const Text('Create your first deck'),
+            ),
+          ],
+        ),
       )
           : ListView.separated(
         itemCount: _decks.length,
@@ -987,27 +1000,26 @@ class _DeckListPageState extends State<DeckListPage> {
             leading: const Icon(Icons.folder),
             title: Text(d.name),
             onTap: () => Navigator.of(context).push(
-                MaterialPageRoute(
-                    builder: (_) => DeckPage(deck: d))),
+              MaterialPageRoute(builder: (_) => DeckPage(deck: d)),
+            ),
             trailing: PopupMenuButton<String>(
               onSelected: (v) {
                 if (v == 'rename') _renameDeck(d);
                 if (v == 'delete') _deleteDeck(d);
               },
               itemBuilder: (_) => const [
-                PopupMenuItem(
-                    value: 'rename', child: Text('Rename')),
-                PopupMenuItem(
-                    value: 'delete', child: Text('Delete')),
+                PopupMenuItem(value: 'rename', child: Text('Rename')),
+                PopupMenuItem(value: 'delete', child: Text('Delete')),
               ],
             ),
           );
         },
       ),
       floatingActionButton: FloatingActionButton.extended(
-          onPressed: _createDeck,
-          icon: const Icon(Icons.create_new_folder),
-          label: const Text('New Deck')),
+        onPressed: _createDeck,
+        icon: const Icon(Icons.create_new_folder),
+        label: const Text('New Deck'),
+      ),
     );
   }
 }
@@ -1054,8 +1066,10 @@ class _DeckPageState extends State<DeckPage> {
         : (c.score >= 0.5 ? Colors.orange : Colors.red);
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-      decoration:
-      BoxDecoration(color: color.withOpacity(0.15), borderRadius: BorderRadius.circular(12)),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.15),
+        borderRadius: BorderRadius.circular(12),
+      ),
       child: Text('$pct%', style: TextStyle(color: color, fontWeight: FontWeight.w600)),
     );
   }
@@ -1082,8 +1096,7 @@ class _DeckPageState extends State<DeckPage> {
           children: [
             Expanded(
               child: ClipRRect(
-                borderRadius:
-                const BorderRadius.vertical(top: Radius.circular(12)),
+                borderRadius: const BorderRadius.vertical(top: Radius.circular(12)),
                 child: sideView(
                   kind: card.frontKind,
                   value: card.front,
@@ -1094,15 +1107,20 @@ class _DeckPageState extends State<DeckPage> {
             ),
             ListTile(
               dense: true,
-              title: Text(card.title,
-                  maxLines: 1, overflow: TextOverflow.ellipsis),
+              title: Text(card.title, maxLines: 1, overflow: TextOverflow.ellipsis),
               subtitle: Row(
                 children: [
                   _scoreChip(card),
                   const SizedBox(width: 8),
-                  Text('EF ${card.ease.toStringAsFixed(2)}'
-                      '${card.due != null ? ' · due ${card.due!.toLocal().toString().split(" ").first}' : ''}',
-                      style: const TextStyle(fontSize: 12)),
+                  Expanded(
+                    child: Text(
+                      'EF ${card.ease.toStringAsFixed(2)}'
+                          '${card.due != null ? ' · due ${card.due!.toLocal().toString().split(" ").first}' : ''}',
+                      style: const TextStyle(fontSize: 12),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
                 ],
               ),
               trailing: PopupMenuButton<String>(
@@ -1134,9 +1152,9 @@ class _DeckPageState extends State<DeckPage> {
 
   Future<void> _create() async {
     final created = await Navigator.of(context).push<FlashcardData?>(
-        MaterialPageRoute(builder: (_) => const EditFlashcardPage()));
+      MaterialPageRoute(builder: (_) => const EditFlashcardPage()),
+    );
     if (created != null) {
-      // persist images if needed
       final dir = await _deckDir(widget.deck.id);
 
       String frontVal = created.front;
@@ -1157,7 +1175,8 @@ class _DeckPageState extends State<DeckPage> {
 
   Future<void> _edit(FlashcardData card) async {
     final updated = await Navigator.of(context).push<FlashcardData?>(
-        MaterialPageRoute(builder: (_) => EditFlashcardPage(existing: card)));
+      MaterialPageRoute(builder: (_) => EditFlashcardPage(existing: card)),
+    );
     if (updated != null) {
       final dir = await _deckDir(widget.deck.id);
 
@@ -1172,7 +1191,6 @@ class _DeckPageState extends State<DeckPage> {
       }
 
       final persisted = updated.copyWith(front: frontVal, back: backVal);
-
       final idx = _cards.indexWhere((c) => c.id == persisted.id);
       if (idx != -1) {
         setState(() => _cards[idx] = persisted);
@@ -1191,12 +1209,9 @@ class _DeckPageState extends State<DeckPage> {
             controller: controller,
             decoration: const InputDecoration(labelText: 'Title')),
         actions: [
-          TextButton(
-              onPressed: () => Navigator.of(ctx).pop(),
+          TextButton(onPressed: () => Navigator.of(ctx).pop(),
               child: const Text('Cancel')),
-          TextButton(
-              onPressed: () =>
-                  Navigator.of(ctx).pop(controller.text.trim()),
+          TextButton(onPressed: () => Navigator.of(ctx).pop(controller.text.trim()),
               child: const Text('Save')),
         ],
       ),
@@ -1216,11 +1231,9 @@ class _DeckPageState extends State<DeckPage> {
         title: const Text('Delete card?'),
         content: Text('Delete "${card.title}" from this deck?'),
         actions: [
-          TextButton(
-              onPressed: () => Navigator.of(ctx).pop(false),
+          TextButton(onPressed: () => Navigator.of(ctx).pop(false),
               child: const Text('Cancel')),
-          TextButton(
-              onPressed: () => Navigator.of(ctx).pop(true),
+          TextButton(onPressed: () => Navigator.of(ctx).pop(true),
               child: const Text('Delete')),
         ],
       ),
@@ -1262,8 +1275,7 @@ class _DeckPageState extends State<DeckPage> {
       const encoder = JsonEncoder.withIndent('  ');
       final jsonStr = encoder.convert(deck);
       final slug = _safeFileSlug(widget.deck.name);
-      final fileName =
-          'deck_${slug}_${DateTime.now().millisecondsSinceEpoch}.json';
+      final fileName = 'deck_${slug}_${DateTime.now().millisecondsSinceEpoch}.json';
 
       final tmp = await getTemporaryDirectory();
       final tmpPath = p.join(tmp.path, fileName);
@@ -1278,8 +1290,8 @@ class _DeckPageState extends State<DeckPage> {
 
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content:
-          Text(savedPath == null ? 'Export canceled' : 'Saved to: $savedPath')));
+        content: Text(savedPath == null ? 'Export canceled' : 'Saved to: $savedPath'),
+      ));
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context)
@@ -1292,8 +1304,7 @@ class _DeckPageState extends State<DeckPage> {
   Future<void> _exportDeckJsonl() async {
     try {
       final slug = _safeFileSlug(widget.deck.name);
-      final fileName =
-          'deck_${slug}_${DateTime.now().millisecondsSinceEpoch}.jsonl';
+      final fileName = 'deck_${slug}_${DateTime.now().millisecondsSinceEpoch}.jsonl';
 
       final tmp = await getTemporaryDirectory();
       final tmpPath = p.join(tmp.path, fileName);
@@ -1324,12 +1335,12 @@ class _DeckPageState extends State<DeckPage> {
 
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content:
-          Text(savedPath == null ? 'Export canceled' : 'Saved to: $savedPath')));
+        content: Text(savedPath == null ? 'Export canceled' : 'Saved to: $savedPath'),
+      ));
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Export (jsonl) failed: $e')));
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Export (jsonl) failed: $e')));
       }
     }
   }
@@ -1350,15 +1361,14 @@ class _DeckPageState extends State<DeckPage> {
       final jsonStr = const JsonEncoder.withIndent('  ').convert(deck);
 
       final slug = _safeFileSlug(widget.deck.name);
-      final fileName =
-          'deck_${slug}_${DateTime.now().millisecondsSinceEpoch}.json';
+      final fileName = 'deck_${slug}_${DateTime.now().millisecondsSinceEpoch}.json';
 
       final tmp = await getTemporaryDirectory();
       final path = p.join(tmp.path, fileName);
       await io.File(path).writeAsString(jsonStr);
 
       await Share.shareXFiles(
-        [XFile(path, mimeType: 'application/json', name: fileName)],
+        [xfile.XFile(path, mimeType: 'application/json', name: fileName)],
         subject: fileName,
         text: 'Flashcards deck: ${widget.deck.name}',
       );
@@ -1382,8 +1392,9 @@ class _DeckPageState extends State<DeckPage> {
     final path = res.files.single.path;
     if (path == null) {
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(const SnackBar(content: Text('No file path available')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No file path available')),
+        );
       }
       return;
     }
@@ -1431,7 +1442,6 @@ class _DeckPageState extends State<DeckPage> {
               try {
                 final raw = FlashcardData.fromJson(m);
 
-                // persist images if needed
                 String frontVal = raw.front;
                 if (raw.frontKind == SideKind.image && raw.front.startsWith('data:')) {
                   frontVal = await _persistDataUrlToFile(raw.front, dir, '${raw.id}_front');
@@ -1493,8 +1503,7 @@ class _DeckPageState extends State<DeckPage> {
       child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            const Icon(Icons.photo_library,
-                size: 90, color: Colors.grey),
+            const Icon(Icons.photo_library, size: 90, color: Colors.grey),
             const SizedBox(height: 8),
             const Text('No cards in this deck'),
             const SizedBox(height: 8),
@@ -1508,8 +1517,7 @@ class _DeckPageState extends State<DeckPage> {
       padding: const EdgeInsets.all(12),
       child: GridView.builder(
         itemCount: _cards.length,
-        gridDelegate:
-        const SliverGridDelegateWithMaxCrossAxisExtent(
+        gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
           maxCrossAxisExtent: 220,
           mainAxisSpacing: 12,
           crossAxisSpacing: 12,
@@ -1521,54 +1529,93 @@ class _DeckPageState extends State<DeckPage> {
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(widget.deck.name),
+        title: Text(widget.deck.name, overflow: TextOverflow.ellipsis),
         actions: [
-          IconButton(
-            onPressed: () {
-              final due = _dueCards();
-              if (due.isEmpty) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Nothing due right now!')),
-                );
-                return;
+          PopupMenuButton<_DeckMenu>(
+            icon: const Icon(Icons.more_vert),
+            onSelected: (m) async {
+              switch (m) {
+                case _DeckMenu.study:
+                  final due = _dueCards();
+                  if (due.isEmpty) {
+                    if (!mounted) return;
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Nothing due right now!')),
+                    );
+                    return;
+                  }
+                  if (!mounted) return;
+                  Navigator.of(context).push(MaterialPageRoute(
+                    builder: (_) => SwipeViewerPage(
+                      cards: due,
+                      initialIndex: 0,
+                      onEdit: (c) => _edit(c),
+                      onDelete: (c) => _delete(c),
+                      onGrade: (c, q) => _recordGrade(c, q),
+                    ),
+                  ));
+                  break;
+                case _DeckMenu.import:
+                  _importDeck();
+                  break;
+                case _DeckMenu.exportJson:
+                  _exportDeck();
+                  break;
+                case _DeckMenu.exportJsonl:
+                  _exportDeckJsonl();
+                  break;
+                case _DeckMenu.share:
+                  _shareDeck();
+                  break;
+                case _DeckMenu.reload:
+                  _load();
+                  break;
               }
-              Navigator.of(context).push(MaterialPageRoute(
-                builder: (_) => SwipeViewerPage(
-                  cards: due,
-                  initialIndex: 0,
-                  onEdit: (c) => _edit(c),
-                  onDelete: (c) => _delete(c),
-                  onGrade: (c, q) => _recordGrade(c, q),
-                ),
-              ));
             },
-            tooltip: 'Study due',
-            icon: const Icon(Icons.play_circle),
-          ),
-          IconButton(
-            onPressed: _importDeck,
-            tooltip: 'Import deck (.json/.jsonl/.gz)',
-            icon: const Icon(Icons.file_open),
-          ),
-          IconButton(
-            onPressed: _exportDeck,
-            tooltip: 'Export deck (.json)',
-            icon: const Icon(Icons.download),
-          ),
-          IconButton(
-            onPressed: _exportDeckJsonl,
-            tooltip: 'Export deck (JSONL)',
-            icon: const Icon(Icons.data_object),
-          ),
-          IconButton(
-            onPressed: _load,
-            tooltip: 'Reload',
-            icon: const Icon(Icons.refresh),
-          ),
-          IconButton(
-            onPressed: _shareDeck,
-            tooltip: 'Share deck',
-            icon: const Icon(Icons.share),
+            itemBuilder: (ctx) => const [
+              PopupMenuItem(
+                value: _DeckMenu.study,
+                child: ListTile(
+                  leading: Icon(Icons.play_circle),
+                  title: Text('Study due'),
+                ),
+              ),
+              PopupMenuItem(
+                value: _DeckMenu.import,
+                child: ListTile(
+                  leading: Icon(Icons.file_open),
+                  title: Text('Import (.json / .jsonl / .gz)'),
+                ),
+              ),
+              PopupMenuItem(
+                value: _DeckMenu.exportJson,
+                child: ListTile(
+                  leading: Icon(Icons.download),
+                  title: Text('Export (.json)'),
+                ),
+              ),
+              PopupMenuItem(
+                value: _DeckMenu.exportJsonl,
+                child: ListTile(
+                  leading: Icon(Icons.data_object),
+                  title: Text('Export (JSONL)'),
+                ),
+              ),
+              PopupMenuItem(
+                value: _DeckMenu.share,
+                child: ListTile(
+                  leading: Icon(Icons.share),
+                  title: Text('Share'),
+                ),
+              ),
+              PopupMenuItem(
+                value: _DeckMenu.reload,
+                child: ListTile(
+                  leading: Icon(Icons.refresh),
+                  title: Text('Reload'),
+                ),
+              ),
+            ],
           ),
         ],
       ),
@@ -1580,7 +1627,7 @@ class _DeckPageState extends State<DeckPage> {
 }
 
 // ============================================================================
-// [ EDIT CARD PAGE ] - choose image/text per side + title
+// [ EDIT CARD PAGE ] - choose image/text per side + title (responsive)
 // ============================================================================
 
 class EditFlashcardPage extends StatefulWidget {
@@ -1643,21 +1690,20 @@ class _EditFlashcardPageState extends State<EditFlashcardPage> {
   }
 
   Future<void> _save() async {
-    // gather from text fields if text kind
     final frontVal = _frontKind == SideKind.text ? _frontText.text.trim() : _front;
     final backVal  = _backKind  == SideKind.text ? _backText.text.trim()  : _back;
 
     if (frontVal == null || frontVal.isEmpty || backVal == null || backVal.isEmpty) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-            content: Text('Please provide both front and back (image or text).')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Please provide both front and back (image or text).')),
+        );
       }
       return;
     }
 
     setState(() => _saving = true);
-    final id =
-        widget.existing?.id ?? DateTime.now().millisecondsSinceEpoch.toString();
+    final id = widget.existing?.id ?? DateTime.now().millisecondsSinceEpoch.toString();
     final card = FlashcardData(
       id: id,
       title: _title.text.trim().isEmpty ? 'Card' : _title.text.trim(),
@@ -1723,9 +1769,11 @@ class _EditFlashcardPageState extends State<EditFlashcardPage> {
                   )
                       : (value == null
                       ? Container(
-                      color: Colors.grey[200],
-                      child: const Center(
-                          child: Icon(Icons.image, size: 56, color: Colors.grey)))
+                    color: Colors.grey[200],
+                    child: const Center(
+                      child: Icon(Icons.image, size: 56, color: Colors.grey),
+                    ),
+                  )
                       : sideView(kind: SideKind.image, value: value, fit: BoxFit.cover)),
                 ),
               ),
@@ -1751,47 +1799,77 @@ class _EditFlashcardPageState extends State<EditFlashcardPage> {
   Widget build(BuildContext context) {
     final isEditing = widget.existing != null;
     return Scaffold(
-      appBar:
-      AppBar(title: Text(isEditing ? 'Edit Card' : 'Create Card')),
+      appBar: AppBar(title: Text(isEditing ? 'Edit Card' : 'Create Card')),
       body: Padding(
         padding: const EdgeInsets.all(12),
         child: Column(children: [
           TextField(
-              controller: _title,
-              decoration:
-              const InputDecoration(labelText: 'Title (optional)')),
+            controller: _title,
+            decoration: const InputDecoration(labelText: 'Title (optional)'),
+          ),
           const SizedBox(height: 8),
           Expanded(
-            child: Row(children: [
-              _sideEditor(
-                label: 'Front',
-                isFront: true,
-                kind: _frontKind,
-                onKind: (k) => setState(() => _frontKind = k),
-                textCtrl: _frontText,
-                value: _front,
-              ),
-              const SizedBox(width: 12),
-              _sideEditor(
-                label: 'Back',
-                isFront: false,
-                kind: _backKind,
-                onKind: (k) => setState(() => _backKind = k),
-                textCtrl: _backText,
-                value: _back,
-              ),
-            ]),
+            child: LayoutBuilder(
+              builder: (context, c) {
+                final isWide = c.maxWidth >= 700;
+                if (isWide) {
+                  return Row(children: [
+                    _sideEditor(
+                      label: 'Front',
+                      isFront: true,
+                      kind: _frontKind,
+                      onKind: (k) => setState(() => _frontKind = k),
+                      textCtrl: _frontText,
+                      value: _front,
+                    ),
+                    const SizedBox(width: 12),
+                    _sideEditor(
+                      label: 'Back',
+                      isFront: false,
+                      kind: _backKind,
+                      onKind: (k) => setState(() => _backKind = k),
+                      textCtrl: _backText,
+                      value: _back,
+                    ),
+                  ]);
+                }
+                // Narrow screens: stack vertically to avoid horizontal overflow
+                return Column(children: [
+                  Expanded(
+                    child: _sideEditor(
+                      label: 'Front',
+                      isFront: true,
+                      kind: _frontKind,
+                      onKind: (k) => setState(() => _frontKind = k),
+                      textCtrl: _frontText,
+                      value: _front,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Expanded(
+                    child: _sideEditor(
+                      label: 'Back',
+                      isFront: false,
+                      kind: _backKind,
+                      onKind: (k) => setState(() => _backKind = k),
+                      textCtrl: _backText,
+                      value: _back,
+                    ),
+                  ),
+                ]);
+              },
+            ),
           ),
           const SizedBox(height: 12),
           Row(children: [
             Expanded(
-                child: ElevatedButton.icon(
-                    onPressed: _saving ? null : _save,
-                    icon: const Icon(Icons.save),
-                    label: Text(_saving
-                        ? 'Saving...'
-                        : (isEditing ? 'Save changes' : 'Create card')))),
-          ])
+              child: ElevatedButton.icon(
+                onPressed: _saving ? null : _save,
+                icon: const Icon(Icons.save),
+                label: Text(_saving ? 'Saving...' : (isEditing ? 'Save changes' : 'Create card')),
+              ),
+            ),
+          ]),
         ]),
       ),
     );
@@ -1825,7 +1903,6 @@ class SwipeViewerPage extends StatefulWidget {
 class _SwipeViewerPageState extends State<SwipeViewerPage> {
   late final PageController _controller;
   late int _index;
-  bool _showBack = false;
 
   @override
   void initState() {
@@ -1833,6 +1910,24 @@ class _SwipeViewerPageState extends State<SwipeViewerPage> {
     _index = widget.initialIndex.clamp(0, widget.cards.length - 1);
     _controller = PageController(initialPage: _index);
   }
+  Color _dueColor(FlashcardData c) {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final d = c.due;
+    if (d == null) return Colors.blueGrey; // never scheduled yet
+    final t = DateTime(d.year, d.month, d.day);
+    final diff = t.difference(today).inDays;
+    if (diff < 0) return Colors.red;      // overdue
+    if (diff == 0) return Colors.orange;  // due today
+    return Colors.green;                   // scheduled in the future
+  }
+
+  Widget _statusDot(FlashcardData c) => Container(
+    width: 10,
+    height: 10,
+    decoration: BoxDecoration(color: _dueColor(c), shape: BoxShape.circle),
+  );
+
 
   @override
   void dispose() {
@@ -1852,7 +1947,6 @@ class _SwipeViewerPageState extends State<SwipeViewerPage> {
   }
 
   Widget _gradeBar(FlashcardData c) {
-    // 0..5 buttons (SM-2 quality)
     final labels = ['0','1','2','3','4','5'];
     return Wrap(
       spacing: 6,
@@ -1861,7 +1955,6 @@ class _SwipeViewerPageState extends State<SwipeViewerPage> {
           onPressed: widget.onGrade == null ? null : () async {
             await widget.onGrade!(c, i);
             if (!mounted) return;
-            // auto-next on grade
             if (_index < widget.cards.length - 1) _go(1);
           },
           child: Text(labels[i]),
@@ -1880,35 +1973,59 @@ class _SwipeViewerPageState extends State<SwipeViewerPage> {
 
     return Scaffold(
       appBar: AppBar(
-        title: Text('${card.title}  (${_index + 1}/${widget.cards.length})'),
+        title: Text(
+          '${card.title}  (${_index + 1}/${widget.cards.length})',
+          overflow: TextOverflow.ellipsis,
+        ),
         actions: [
-          if (widget.onEdit != null)
-            IconButton(
-              icon: const Icon(Icons.edit),
-              onPressed: () => widget.onEdit!(card),
-              tooltip: 'Edit',
-            ),
-          if (widget.onDelete != null)
-            IconButton(
-              icon: const Icon(Icons.delete),
-              onPressed: () async {
-                await widget.onDelete!(card);
-                if (!mounted) return;
-                if (_index >= widget.cards.length) {
-                  Navigator.pop(context);
-                } else {
-                  setState(() {});
-                }
-              },
-              tooltip: 'Delete',
-            ),
+          PopupMenuButton<_SwipeMenu>(
+            icon: const Icon(Icons.more_vert),
+            onSelected: (m) async {
+              final current = widget.cards[_index];
+              switch (m) {
+                case _SwipeMenu.edit:
+                  if (widget.onEdit != null) {
+                    await widget.onEdit!(current);
+                    if (!mounted) return;
+                    setState(() {}); // refresh
+                  }
+                  break;
+                case _SwipeMenu.delete:
+                  if (widget.onDelete != null) {
+                    await widget.onDelete!(current);
+                    if (!mounted) return;
+                    if (_index >= widget.cards.length) {
+                      Navigator.pop(context);
+                    } else {
+                      setState(() {});
+                    }
+                  }
+                  break;
+              }
+            },
+            itemBuilder: (ctx) => const [
+              PopupMenuItem(
+                value: _SwipeMenu.edit,
+                child: ListTile(
+                  leading: Icon(Icons.edit),
+                  title: Text('Edit'),
+                ),
+              ),
+              PopupMenuItem(
+                value: _SwipeMenu.delete,
+                child: ListTile(
+                  leading: Icon(Icons.delete),
+                  title: Text('Delete'),
+                ),
+              ),
+            ],
+          ),
         ],
       ),
       body: PageView.builder(
         controller: _controller,
         onPageChanged: (i) => setState(() {
           _index = i;
-          _showBack = false;
         }),
         itemCount: widget.cards.length,
         itemBuilder: (_, i) {
@@ -1938,10 +2055,17 @@ class _SwipeViewerPageState extends State<SwipeViewerPage> {
                   Row(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
-                      Text('Score: ${(c.score*100).toStringAsFixed(0)}% · EF ${c.ease.toStringAsFixed(2)}'
-                          '${c.due != null ? ' · due ${c.due!.toLocal().toString().split(" ").first}' : ''}'),
+                      _statusDot(c),                  // color only; no text
+                      const SizedBox(width: 8),
+                      Flexible(
+                        child: Text(
+                          'Score: ${(c.score * 100).toStringAsFixed(0)}% · EF ${c.ease.toStringAsFixed(2)}',
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
                     ],
                   ),
+
                   const SizedBox(height: 8),
                   _gradeBar(c),
                 ],
