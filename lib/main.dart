@@ -1,9 +1,12 @@
 // ============================================================================
-// main.dart — Flashcards app (Decks + smaller cards + rename + import/export)
-// Includes: main(), Settings (theme + export location), Storage, UI pages.
+// main.dart — Flashcards app (Decks + text-or-image sides + SM-2 scheduling)
+// Includes: main(), Settings, Storage, JSON streaming import/export, UI pages.
 // ============================================================================
 
-import 'dart:convert';
+import 'dart:convert'
+    show jsonDecode, jsonEncode, JsonEncoder, utf8, LineSplitter,
+    base64Decode, base64Encode, gzip;
+import 'dart:convert' as convert show gzip;
 import 'dart:isolate';
 import 'dart:typed_data';
 import 'dart:io' as io;
@@ -156,7 +159,7 @@ void parseDeckIsolate(Map<String, dynamic> args) async {
 
     Stream<List<int>> openBytes() {
       final s = io.File(path).openRead();
-      return isGz ? s.transform(io.gzip.decoder) : s; // gzip from dart:io
+      return isGz ? s.transform(io.GZipCodec().decoder) : s;
     }
 
     if (isJsonl) {
@@ -281,7 +284,6 @@ class SettingsScope extends InheritedWidget {
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  // OK via material.dart re-export; no extra import needed.
   PaintingBinding.instance.imageCache.maximumSizeBytes = 120 * 1024 * 1024;
   final settings = await AppSettings.load();
   runApp(MyApp(settings: settings));
@@ -333,8 +335,12 @@ class _MyAppState extends State<MyApp> {
 }
 
 // ============================================================================
-// [ MODELS ] - DeckMeta, FlashcardData
+// [ MODELS ] - DeckMeta, FlashcardData (+ text-or-image, stats, SM-2)
 // ============================================================================
+
+enum SideKind { image, text }
+SideKind _kindFromJson(dynamic v) => (v == 'text') ? SideKind.text : SideKind.image;
+String _kindToJson(SideKind k) => k == SideKind.text ? 'text' : 'image';
 
 class DeckMeta {
   final String id;
@@ -348,51 +354,172 @@ class DeckMeta {
 
 class FlashcardData {
   final String id;
-  final String title; // user-renameable
-  final String front; // data URL or file path
-  final String back;  // data URL or file path
+  final String title;
+  final String front;
+  final String back;
+  final SideKind frontKind;
+  final SideKind backKind;
+
+  // Ranking / stats
+  final int correct;
+  final int wrong;
+
+  // SM-2 spaced repetition
+  final int reps;           // consecutive successful repetitions
+  final int intervalDays;   // current interval in days
+  final double ease;        // ease factor (>= 1.3)
+  final DateTime? due;      // next due date
 
   const FlashcardData({
     required this.id,
     required this.title,
     required this.front,
     required this.back,
+    this.frontKind = SideKind.image,
+    this.backKind  = SideKind.image,
+    this.correct = 0,
+    this.wrong = 0,
+    this.reps = 0,
+    this.intervalDays = 0,
+    this.ease = 2.5,
+    this.due,
   });
+
+  double get score => (correct + wrong) == 0 ? 0.0 : correct / (correct + wrong);
 
   FlashcardData copyWith({
     String? id,
     String? title,
     String? front,
     String? back,
+    SideKind? frontKind,
+    SideKind? backKind,
+    int? correct,
+    int? wrong,
+    int? reps,
+    int? intervalDays,
+    double? ease,
+    DateTime? due,
   }) {
     return FlashcardData(
       id: id ?? this.id,
       title: title ?? this.title,
       front: front ?? this.front,
       back: back ?? this.back,
+      frontKind: frontKind ?? this.frontKind,
+      backKind:  backKind  ?? this.backKind,
+      correct: correct ?? this.correct,
+      wrong: wrong ?? this.wrong,
+      reps: reps ?? this.reps,
+      intervalDays: intervalDays ?? this.intervalDays,
+      ease: ease ?? this.ease,
+      due: due ?? this.due,
     );
   }
 
-  Map<String, dynamic> toJson() =>
-      {'id': id, 'title': title, 'front': front, 'back': back};
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'title': title,
+    'front': front,
+    'back': back,
+    'frontKind': _kindToJson(frontKind),
+    'backKind':  _kindToJson(backKind),
+    'correct': correct,
+    'wrong': wrong,
+    'reps': reps,
+    'intervalDays': intervalDays,
+    'ease': ease,
+    'due': due?.toIso8601String(),
+  };
 
-  static FlashcardData fromJson(Map<String, dynamic> json) => FlashcardData(
-    id: json['id'] as String,
-    title: (json['title'] as String?) ?? 'Card',
-    front: json['front'] as String,
-    back: json['back'] as String,
+  static FlashcardData fromJson(Map<String, dynamic> j) => FlashcardData(
+    id: j['id'] as String,
+    title: (j['title'] as String?) ?? 'Card',
+    front: j['front'] as String,
+    back:  j['back']  as String,
+    frontKind: _kindFromJson(j['frontKind']),
+    backKind:  _kindFromJson(j['backKind']),
+    correct: (j['correct'] as int?) ?? 0,
+    wrong: (j['wrong'] as int?) ?? 0,
+    reps: (j['reps'] as int?) ?? 0,
+    intervalDays: (j['intervalDays'] as int?) ?? 0,
+    ease: (j['ease'] as num?)?.toDouble() ?? 2.5,
+    due: j['due'] != null ? DateTime.tryParse(j['due']) : null,
   );
 }
 
 // ============================================================================
-// [ HELPERS ] - data URL, mime guessing, safe file names, img widget
+// [ SM-2 ] - scheduler util
 // ============================================================================
 
+FlashcardData applySm2(FlashcardData c, int q, {DateTime? now}) {
+  now ??= DateTime.now();
+  q = q.clamp(0, 5);
+
+  // Update EF
+  final efPrime = c.ease + (0.1 - (5 - q) * (0.08 + (5 - q) * 0.02));
+  final newEf = efPrime < 1.3 ? 1.3 : efPrime;
+
+  int newReps;
+  int newInterval;
+  if (q < 3) {
+    newReps = 0;
+    newInterval = 1;
+  } else {
+    newReps = c.reps + 1;
+    if (newReps == 1) {
+      newInterval = 1;
+    } else if (newReps == 2) {
+      newInterval = 6;
+    } else {
+      newInterval = (c.intervalDays * newEf).round().clamp(1, 36500);
+    }
+  }
+
+  final startOfToday = DateTime(now.year, now.month, now.day);
+  final nextDue = startOfToday.add(Duration(days: newInterval));
+
+  return c.copyWith(
+    reps: newReps,
+    intervalDays: newInterval,
+    ease: newEf,
+    due: nextDue,
+  );
+}
+
+// ============================================================================
+// [ HELPERS ] - data URL, mime guessing, safe file names, sideView
+// ============================================================================
+
+Widget sideView({
+  required SideKind kind,
+  required String value,
+  BoxFit fit = BoxFit.cover,
+  int? cacheWidth,
+}) {
+  if (kind == SideKind.text) {
+    return Container(
+      color: Colors.white,
+      alignment: Alignment.center,
+      padding: const EdgeInsets.all(16),
+      child: SingleChildScrollView(
+        child: Text(
+          value,
+          textAlign: TextAlign.center,
+          style: const TextStyle(fontSize: 20, height: 1.2),
+        ),
+      ),
+    );
+  } else {
+    return imageFromSource(value, fit: fit, cacheWidth: cacheWidth);
+  }
+}
+
 Future<Map<String, dynamic>> _cardToPortableJson(FlashcardData c) async {
-  Future<String> asDataUrl(String src) async {
+  Future<String> ensureDataUrlIfImage(SideKind k, String src) async {
+    if (k == SideKind.text) return src; // keep text as-is
     if (src.startsWith('data:')) return src;
-    final path =
-    src.startsWith('file://') ? io.File.fromUri(Uri.parse(src)).path : src;
+    final path = src.startsWith('file://') ? io.File.fromUri(Uri.parse(src)).path : src;
     final bytes = await io.File(path).readAsBytes();
     return _bytesToDataUrl(bytes, mime: 'image/jpeg');
   }
@@ -400,8 +527,17 @@ Future<Map<String, dynamic>> _cardToPortableJson(FlashcardData c) async {
   return {
     'id': c.id,
     'title': c.title,
-    'front': await asDataUrl(c.front),
-    'back': await asDataUrl(c.back),
+    'frontKind': _kindToJson(c.frontKind),
+    'backKind':  _kindToJson(c.backKind),
+    'front': await ensureDataUrlIfImage(c.frontKind, c.front),
+    'back' : await ensureDataUrlIfImage(c.backKind,  c.back),
+    // include stats & SM-2 so exports roundtrip
+    'correct': c.correct,
+    'wrong': c.wrong,
+    'reps': c.reps,
+    'intervalDays': c.intervalDays,
+    'ease': c.ease,
+    'due': c.due?.toIso8601String(),
   };
 }
 
@@ -605,7 +741,7 @@ class Store {
 }
 
 // ============================================================================
-// [ SETTINGS PAGE ] - theme + export location options (RadioGroup!)
+// [ SETTINGS PAGE ] - (kept simple; deprecation warnings are harmless)
 // ============================================================================
 
 class SettingsPage extends StatefulWidget {
@@ -625,71 +761,72 @@ class _SettingsPageState extends State<SettingsPage> {
       body: ListView(
         children: [
           const ListTile(title: Text('Appearance'), subtitle: Text('Theme')),
-          // New RadioGroup API: manages groupValue and onChanged.
-          RadioGroup<int>(
+          RadioListTile<int>(
+            value: 0,
             groupValue: s.themeIdx,
-            onChanged: (v) => setState(() => s.themeIdx = v ?? s.themeIdx),
-            child: Column(
-              children: const [
-                RadioListTile<int>(value: 0, title: Text('System')),
-                RadioListTile<int>(value: 1, title: Text('Light')),
-                RadioListTile<int>(value: 2, title: Text('Dark')),
-              ],
-            ),
+            onChanged: (v) => setState(() => s.themeIdx = v!),
+            title: const Text('System'),
           ),
-
+          RadioListTile<int>(
+            value: 1,
+            groupValue: s.themeIdx,
+            onChanged: (v) => setState(() => s.themeIdx = v!),
+            title: const Text('Light'),
+          ),
+          RadioListTile<int>(
+            value: 2,
+            groupValue: s.themeIdx,
+            onChanged: (v) => setState(() => s.themeIdx = v!),
+            title: const Text('Dark'),
+          ),
           const Divider(),
           const ListTile(
             title: Text('Export'),
             subtitle: Text('Where to save deck JSON'),
           ),
-          RadioGroup<int>(
+          RadioListTile<int>(
+            value: 0,
             groupValue: s.exportIdx,
-            onChanged: (v) => setState(() => s.exportIdx = v ?? s.exportIdx),
-            child: Column(
-              children: [
-                const RadioListTile<int>(
-                  value: 0,
-                  title: Text('Ask every time'),
-                  subtitle: Text('Pick a folder on export'),
-                ),
-                const RadioListTile<int>(
-                  value: 1,
-                  title: Text('App Documents'),
-                  subtitle: Text('Saves under the app’s documents directory'),
-                ),
-                RadioListTile<int>(
-                  value: 2,
-                  title: const Text('Custom folder'),
-                  subtitle: Text(
-                    s.customDir?.isNotEmpty == true ? s.customDir! : 'Not set',
-                  ),
-                  secondary: _picking
-                      ? const SizedBox(
-                    width: 24,
-                    height: 24,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                      : IconButton(
-                    tooltip: 'Choose folder',
-                    icon: const Icon(Icons.folder_open),
-                    onPressed: () async {
-                      setState(() => _picking = true);
-                      try {
-                        final dir = await FilePicker.platform
-                            .getDirectoryPath(
-                            dialogTitle: 'Choose export folder');
-                        if (dir != null) {
-                          s.customDir = dir;
-                          s.exportIdx = 2;
-                        }
-                      } finally {
-                        if (mounted) setState(() => _picking = false);
-                      }
-                    },
-                  ),
-                ),
-              ],
+            onChanged: (v) => setState(() => s.exportIdx = v!),
+            title: const Text('Ask every time'),
+            subtitle: const Text('Pick a folder on export'),
+          ),
+          RadioListTile<int>(
+            value: 1,
+            groupValue: s.exportIdx,
+            onChanged: (v) => setState(() => s.exportIdx = v!),
+            title: const Text('App Documents'),
+            subtitle: const Text('Saves under the app’s documents directory'),
+          ),
+          RadioListTile<int>(
+            value: 2,
+            groupValue: s.exportIdx,
+            onChanged: (v) => setState(() => s.exportIdx = v!),
+            title: const Text('Custom folder'),
+            subtitle: Text(s.customDir?.isNotEmpty == true
+                ? s.customDir!
+                : 'Not set'),
+            secondary: _picking
+                ? const SizedBox(
+                width: 24,
+                height: 24,
+                child: CircularProgressIndicator(strokeWidth: 2))
+                : IconButton(
+              tooltip: 'Choose folder',
+              icon: const Icon(Icons.folder_open),
+              onPressed: () async {
+                setState(() => _picking = true);
+                try {
+                  final dir = await FilePicker.platform.getDirectoryPath(
+                      dialogTitle: 'Choose export folder');
+                  if (dir != null) {
+                    s.customDir = dir;
+                    s.exportIdx = 2;
+                  }
+                } finally {
+                  if (mounted) setState(() => _picking = false);
+                }
+              },
             ),
           ),
           const Padding(
@@ -876,7 +1013,7 @@ class _DeckListPageState extends State<DeckListPage> {
 }
 
 // ============================================================================
-// [ DECK PAGE ] - grid of smaller cards + per-deck import/export
+// [ DECK PAGE ] - grid + import/export + "Study due" + SM-2 grading
 // ============================================================================
 
 class DeckPage extends StatefulWidget {
@@ -896,6 +1033,33 @@ class _DeckPageState extends State<DeckPage> {
     _load();
   }
 
+  List<FlashcardData> _dueCards() {
+    final now = DateTime.now();
+    final eod = DateTime(now.year, now.month, now.day).add(const Duration(days: 1));
+    final due = _cards.where((c) => c.due == null || c.due!.isBefore(eod)).toList();
+    due.sort((a, b) {
+      final ad = a.due ?? DateTime.fromMillisecondsSinceEpoch(0);
+      final bd = b.due ?? DateTime.fromMillisecondsSinceEpoch(0);
+      final cmp = ad.compareTo(bd);
+      if (cmp != 0) return cmp;
+      return a.ease.compareTo(b.ease);
+    });
+    return due;
+  }
+
+  Widget _scoreChip(FlashcardData c) {
+    final pct = (c.score * 100).toStringAsFixed(0);
+    final color = c.score >= 0.8
+        ? Colors.green
+        : (c.score >= 0.5 ? Colors.orange : Colors.red);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+      decoration:
+      BoxDecoration(color: color.withOpacity(0.15), borderRadius: BorderRadius.circular(12)),
+      child: Text('$pct%', style: TextStyle(color: color, fontWeight: FontWeight.w600)),
+    );
+  }
+
   Widget _gridTile(FlashcardData card, int index) {
     return Card(
       elevation: 2,
@@ -909,6 +1073,7 @@ class _DeckPageState extends State<DeckPage> {
               initialIndex: index,
               onEdit: (c) => _edit(c),
               onDelete: (c) => _delete(c),
+              onGrade: (c, q) => _recordGrade(c, q),
             ),
           ),
         ),
@@ -919,14 +1084,27 @@ class _DeckPageState extends State<DeckPage> {
               child: ClipRRect(
                 borderRadius:
                 const BorderRadius.vertical(top: Radius.circular(12)),
-                child: imageFromSource(card.front,
-                    fit: BoxFit.cover, cacheWidth: 512),
+                child: sideView(
+                  kind: card.frontKind,
+                  value: card.front,
+                  fit: BoxFit.cover,
+                  cacheWidth: 512,
+                ),
               ),
             ),
             ListTile(
               dense: true,
               title: Text(card.title,
                   maxLines: 1, overflow: TextOverflow.ellipsis),
+              subtitle: Row(
+                children: [
+                  _scoreChip(card),
+                  const SizedBox(width: 8),
+                  Text('EF ${card.ease.toStringAsFixed(2)}'
+                      '${card.due != null ? ' · due ${card.due!.toLocal().toString().split(" ").first}' : ''}',
+                      style: const TextStyle(fontSize: 12)),
+                ],
+              ),
               trailing: PopupMenuButton<String>(
                 onSelected: (v) {
                   if (v == 'edit') _edit(card);
@@ -934,7 +1112,7 @@ class _DeckPageState extends State<DeckPage> {
                   if (v == 'delete') _delete(card);
                 },
                 itemBuilder: (_) => const [
-                  PopupMenuItem(value: 'edit', child: Text('Edit images')),
+                  PopupMenuItem(value: 'edit', child: Text('Edit')),
                   PopupMenuItem(value: 'rename', child: Text('Rename')),
                   PopupMenuItem(value: 'delete', child: Text('Delete')),
                 ],
@@ -958,17 +1136,20 @@ class _DeckPageState extends State<DeckPage> {
     final created = await Navigator.of(context).push<FlashcardData?>(
         MaterialPageRoute(builder: (_) => const EditFlashcardPage()));
     if (created != null) {
+      // persist images if needed
       final dir = await _deckDir(widget.deck.id);
-      final frontPath = created.front.startsWith('data:')
-          ? await _persistDataUrlToFile(
-          created.front, dir, '${created.id}_front')
-          : created.front;
-      final backPath = created.back.startsWith('data:')
-          ? await _persistDataUrlToFile(
-          created.back, dir, '${created.id}_back')
-          : created.back;
 
-      final persisted = created.copyWith(front: frontPath, back: backPath);
+      String frontVal = created.front;
+      if (created.frontKind == SideKind.image && created.front.startsWith('data:')) {
+        frontVal = await _persistDataUrlToFile(created.front, dir, '${created.id}_front');
+      }
+
+      String backVal = created.back;
+      if (created.backKind == SideKind.image && created.back.startsWith('data:')) {
+        backVal = await _persistDataUrlToFile(created.back, dir, '${created.id}_back');
+      }
+
+      final persisted = created.copyWith(front: frontVal, back: backVal);
       setState(() => _cards.add(persisted));
       await _save();
     }
@@ -979,16 +1160,18 @@ class _DeckPageState extends State<DeckPage> {
         MaterialPageRoute(builder: (_) => EditFlashcardPage(existing: card)));
     if (updated != null) {
       final dir = await _deckDir(widget.deck.id);
-      final frontPath = updated.front.startsWith('data:')
-          ? await _persistDataUrlToFile(
-          updated.front, dir, '${updated.id}_front')
-          : updated.front;
-      final backPath = updated.back.startsWith('data:')
-          ? await _persistDataUrlToFile(
-          updated.back, dir, '${updated.id}_back')
-          : updated.back;
 
-      final persisted = updated.copyWith(front: frontPath, back: backPath);
+      String frontVal = updated.front;
+      if (updated.frontKind == SideKind.image && updated.front.startsWith('data:')) {
+        frontVal = await _persistDataUrlToFile(updated.front, dir, '${updated.id}_front');
+      }
+
+      String backVal = updated.back;
+      if (updated.backKind == SideKind.image && updated.back.startsWith('data:')) {
+        backVal = await _persistDataUrlToFile(updated.back, dir, '${updated.id}_back');
+      }
+
+      final persisted = updated.copyWith(front: frontVal, back: backVal);
 
       final idx = _cards.indexWhere((c) => c.id == persisted.id);
       if (idx != -1) {
@@ -1021,8 +1204,7 @@ class _DeckPageState extends State<DeckPage> {
     if (title == null || title.isEmpty) return;
     final idx = _cards.indexWhere((c) => c.id == card.id);
     if (idx != -1) {
-      setState(() => _cards[idx] =
-          FlashcardData(id: card.id, title: title, front: card.front, back: card.back));
+      setState(() => _cards[idx] = card.copyWith(title: title));
       await _save();
     }
   }
@@ -1049,6 +1231,19 @@ class _DeckPageState extends State<DeckPage> {
     }
   }
 
+  Future<void> _recordGrade(FlashcardData card, int q) async {
+    final idx = _cards.indexWhere((c) => c.id == card.id);
+    if (idx == -1) return;
+
+    final base = (q >= 3)
+        ? card.copyWith(correct: card.correct + 1)
+        : card.copyWith(wrong: card.wrong + 1);
+
+    final updated = applySm2(base, q);
+    setState(() => _cards[idx] = updated);
+    await _save();
+  }
+
   // --- Export: Portable .json (rehydrates images to data URLs) ---
   Future<void> _exportDeck() async {
     try {
@@ -1064,8 +1259,8 @@ class _DeckPageState extends State<DeckPage> {
         'cards': cardsJson,
       };
 
-      final jsonStr = const JsonEncoder.withIndent('  ').convert(deck);
-
+      const encoder = JsonEncoder.withIndent('  ');
+      final jsonStr = encoder.convert(deck);
       final slug = _safeFileSlug(widget.deck.name);
       final fileName =
           'deck_${slug}_${DateTime.now().millisecondsSinceEpoch}.json';
@@ -1104,7 +1299,6 @@ class _DeckPageState extends State<DeckPage> {
       final tmpPath = p.join(tmp.path, fileName);
       final sink = io.File(tmpPath).openWrite();
 
-      // Minimal header/meta on first line
       sink.writeln(jsonEncode({
         '_meta': {
           'schema': 'flashcards.simple.v1',
@@ -1140,12 +1334,12 @@ class _DeckPageState extends State<DeckPage> {
     }
   }
 
-  // --- Share current deck (.json) using new share_plus API ---
+  // --- Share current deck (.json) ---
   Future<void> _shareDeck() async {
     try {
       final cardsJson = <Map<String, dynamic>>[];
       for (final c in _cards) {
-        cardsJson.add(await _cardToPortableJson(c)); // rehydrate to data URLs
+        cardsJson.add(await _cardToPortableJson(c));
       }
       final deck = {
         'schema': 'flashcards.simple.v1',
@@ -1163,11 +1357,11 @@ class _DeckPageState extends State<DeckPage> {
       final path = p.join(tmp.path, fileName);
       await io.File(path).writeAsString(jsonStr);
 
-      await SharePlus.instance.share(ShareParams(
-        files: [XFile(path, mimeType: 'application/json', name: fileName)],
+      await Share.shareXFiles(
+        [XFile(path, mimeType: 'application/json', name: fileName)],
         subject: fileName,
         text: 'Flashcards deck: ${widget.deck.name}',
-      ));
+      );
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context)
@@ -1180,7 +1374,6 @@ class _DeckPageState extends State<DeckPage> {
   Future<void> _importDeck() async {
     final res = await FilePicker.platform.pickFiles(
       type: FileType.custom,
-      // Use 'gz' to allow .json.gz / .jsonl.gz (FilePicker matches last extension)
       allowedExtensions: ['json', 'jsonl', 'gz', 'deckjson'],
       withData: false,
     );
@@ -1195,7 +1388,6 @@ class _DeckPageState extends State<DeckPage> {
       return;
     }
 
-    // Progress dialog (PopScope replaces WillPopScope)
     final progress = ValueNotifier<double?>(null);
     bool dialogOpen = true;
     showDialog(
@@ -1239,16 +1431,17 @@ class _DeckPageState extends State<DeckPage> {
               try {
                 final raw = FlashcardData.fromJson(m);
 
-                final frontPath = raw.front.startsWith('data:')
-                    ? await _persistDataUrlToFile(
-                    raw.front, dir, '${raw.id}_front')
-                    : raw.front;
-                final backPath = raw.back.startsWith('data:')
-                    ? await _persistDataUrlToFile(
-                    raw.back, dir, '${raw.id}_back')
-                    : raw.back;
+                // persist images if needed
+                String frontVal = raw.front;
+                if (raw.frontKind == SideKind.image && raw.front.startsWith('data:')) {
+                  frontVal = await _persistDataUrlToFile(raw.front, dir, '${raw.id}_front');
+                }
+                String backVal = raw.back;
+                if (raw.backKind == SideKind.image && raw.back.startsWith('data:')) {
+                  backVal = await _persistDataUrlToFile(raw.back, dir, '${raw.id}_back');
+                }
 
-                toAdd.add(raw.copyWith(front: frontPath, back: backPath));
+                toAdd.add(raw.copyWith(front: frontVal, back: backVal));
               } catch (_) {}
             }
 
@@ -1331,6 +1524,28 @@ class _DeckPageState extends State<DeckPage> {
         title: Text(widget.deck.name),
         actions: [
           IconButton(
+            onPressed: () {
+              final due = _dueCards();
+              if (due.isEmpty) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Nothing due right now!')),
+                );
+                return;
+              }
+              Navigator.of(context).push(MaterialPageRoute(
+                builder: (_) => SwipeViewerPage(
+                  cards: due,
+                  initialIndex: 0,
+                  onEdit: (c) => _edit(c),
+                  onDelete: (c) => _delete(c),
+                  onGrade: (c, q) => _recordGrade(c, q),
+                ),
+              ));
+            },
+            tooltip: 'Study due',
+            icon: const Icon(Icons.play_circle),
+          ),
+          IconButton(
             onPressed: _importDeck,
             tooltip: 'Import deck (.json/.jsonl/.gz)',
             icon: const Icon(Icons.file_open),
@@ -1365,7 +1580,7 @@ class _DeckPageState extends State<DeckPage> {
 }
 
 // ============================================================================
-// [ EDIT CARD PAGE ] - choose front/back images + title
+// [ EDIT CARD PAGE ] - choose image/text per side + title
 // ============================================================================
 
 class EditFlashcardPage extends StatefulWidget {
@@ -1377,22 +1592,38 @@ class EditFlashcardPage extends StatefulWidget {
 }
 
 class _EditFlashcardPageState extends State<EditFlashcardPage> {
-  String? _front;
-  String? _back;
+  SideKind _frontKind = SideKind.image;
+  SideKind _backKind = SideKind.image;
+
+  String? _front; // image data URL or text
+  String? _back;  // image data URL or text
+
   late final TextEditingController _title;
+  late final TextEditingController _frontText;
+  late final TextEditingController _backText;
+
   bool _saving = false;
 
   @override
   void initState() {
     super.initState();
-    _front = widget.existing?.front;
-    _back = widget.existing?.back;
     _title = TextEditingController(text: widget.existing?.title ?? 'Card');
+
+    _frontKind = widget.existing?.frontKind ?? SideKind.image;
+    _backKind  = widget.existing?.backKind  ?? SideKind.image;
+
+    _front = widget.existing?.front;
+    _back  = widget.existing?.back;
+
+    _frontText = TextEditingController(text: _frontKind == SideKind.text ? (_front ?? '') : '');
+    _backText  = TextEditingController(text: _backKind  == SideKind.text ? (_back  ?? '') : '');
   }
 
   @override
   void dispose() {
     _title.dispose();
+    _frontText.dispose();
+    _backText.dispose();
     super.dispose();
   }
 
@@ -1402,30 +1633,118 @@ class _EditFlashcardPageState extends State<EditFlashcardPage> {
     if (dataUrl == null) return;
     setState(() {
       if (isFront) {
+        _frontKind = SideKind.image;
         _front = dataUrl;
       } else {
+        _backKind = SideKind.image;
         _back = dataUrl;
       }
     });
   }
 
   Future<void> _save() async {
-    if (_front == null || _back == null) {
+    // gather from text fields if text kind
+    final frontVal = _frontKind == SideKind.text ? _frontText.text.trim() : _front;
+    final backVal  = _backKind  == SideKind.text ? _backText.text.trim()  : _back;
+
+    if (frontVal == null || frontVal.isEmpty || backVal == null || backVal.isEmpty) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-            content: Text('Please select both front and back images.')));
+            content: Text('Please provide both front and back (image or text).')));
       }
       return;
     }
+
     setState(() => _saving = true);
     final id =
         widget.existing?.id ?? DateTime.now().millisecondsSinceEpoch.toString();
     final card = FlashcardData(
-        id: id,
-        title: _title.text.trim().isEmpty ? 'Card' : _title.text.trim(),
-        front: _front!,
-        back: _back!);
+      id: id,
+      title: _title.text.trim().isEmpty ? 'Card' : _title.text.trim(),
+      front: frontVal,
+      back: backVal,
+      frontKind: _frontKind,
+      backKind: _backKind,
+      // keep existing stats/schedule if editing
+      correct: widget.existing?.correct ?? 0,
+      wrong: widget.existing?.wrong ?? 0,
+      reps: widget.existing?.reps ?? 0,
+      intervalDays: widget.existing?.intervalDays ?? 0,
+      ease: widget.existing?.ease ?? 2.5,
+      due: widget.existing?.due,
+    );
     if (mounted) Navigator.of(context).pop(card);
+  }
+
+  Widget _sideEditor({
+    required String label,
+    required bool isFront,
+    required SideKind kind,
+    required ValueChanged<SideKind> onKind,
+    required TextEditingController textCtrl,
+    required String? value,
+  }) {
+    return Expanded(
+      child: Column(
+        children: [
+          Row(
+            children: [
+              Text(label, style: const TextStyle(fontWeight: FontWeight.w600)),
+              const Spacer(),
+              SegmentedButton<SideKind>(
+                segments: const [
+                  ButtonSegment(value: SideKind.image, label: Text('Image'), icon: Icon(Icons.image)),
+                  ButtonSegment(value: SideKind.text,  label: Text('Text'),  icon: Icon(Icons.text_fields)),
+                ],
+                selected: {kind},
+                onSelectionChanged: (s) => onKind(s.first),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Expanded(
+            child: GestureDetector(
+              onTap: kind == SideKind.image ? () => _pick(isFront) : null,
+              child: Card(
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(12),
+                  child: kind == SideKind.text
+                      ? Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: TextField(
+                      controller: textCtrl,
+                      maxLines: null,
+                      decoration: const InputDecoration(
+                        hintText: 'Enter text…',
+                        border: InputBorder.none,
+                      ),
+                    ),
+                  )
+                      : (value == null
+                      ? Container(
+                      color: Colors.grey[200],
+                      child: const Center(
+                          child: Icon(Icons.image, size: 56, color: Colors.grey)))
+                      : sideView(kind: SideKind.image, value: value, fit: BoxFit.cover)),
+                ),
+              ),
+            ),
+          ),
+          if (kind == SideKind.image) const SizedBox(height: 8),
+          if (kind == SideKind.image)
+            Row(
+              children: [
+                OutlinedButton.icon(
+                  onPressed: () => _pick(isFront),
+                  icon: const Icon(Icons.upload),
+                  label: const Text('Pick image'),
+                ),
+              ],
+            ),
+        ],
+      ),
+    );
   }
 
   @override
@@ -1444,44 +1763,22 @@ class _EditFlashcardPageState extends State<EditFlashcardPage> {
           const SizedBox(height: 8),
           Expanded(
             child: Row(children: [
-              Expanded(
-                child: GestureDetector(
-                  onTap: () => _pick(true),
-                  child: Card(
-                    shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(12)),
-                    child: ClipRRect(
-                      borderRadius: BorderRadius.circular(12),
-                      child: _front == null
-                          ? Container(
-                          color: Colors.grey[200],
-                          child: const Center(
-                              child: Icon(Icons.image,
-                                  size: 56, color: Colors.grey)))
-                          : imageFromSource(_front!, fit: BoxFit.cover),
-                    ),
-                  ),
-                ),
+              _sideEditor(
+                label: 'Front',
+                isFront: true,
+                kind: _frontKind,
+                onKind: (k) => setState(() => _frontKind = k),
+                textCtrl: _frontText,
+                value: _front,
               ),
               const SizedBox(width: 12),
-              Expanded(
-                child: GestureDetector(
-                  onTap: () => _pick(false),
-                  child: Card(
-                    shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(12)),
-                    child: ClipRRect(
-                      borderRadius: BorderRadius.circular(12),
-                      child: _back == null
-                          ? Container(
-                          color: Colors.grey[200],
-                          child: const Center(
-                              child: Icon(Icons.image,
-                                  size: 56, color: Colors.grey)))
-                          : imageFromSource(_back!, fit: BoxFit.cover),
-                    ),
-                  ),
-                ),
+              _sideEditor(
+                label: 'Back',
+                isFront: false,
+                kind: _backKind,
+                onKind: (k) => setState(() => _backKind = k),
+                textCtrl: _backText,
+                value: _back,
               ),
             ]),
           ),
@@ -1502,58 +1799,7 @@ class _EditFlashcardPageState extends State<EditFlashcardPage> {
 }
 
 // ============================================================================
-// [ VIEW CARD PAGE ] - flip front/back
-// ============================================================================
-
-class ViewFlashcardPage extends StatelessWidget {
-  final FlashcardData card;
-  final VoidCallback onEdit;
-  final VoidCallback onDelete;
-  const ViewFlashcardPage(
-      {super.key,
-        required this.card,
-        required this.onEdit,
-        required this.onDelete});
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: Text(card.title), actions: [
-        IconButton(onPressed: onEdit, icon: const Icon(Icons.edit)),
-        IconButton(
-            onPressed: () {
-              onDelete();
-              Navigator.of(context).pop();
-            },
-            icon: const Icon(Icons.delete)),
-      ]),
-      body: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Card(
-            elevation: 6,
-            shape:
-            RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(16),
-              child: SizedBox(
-                height: 420,
-                width: 320,
-                child: FlipCard(
-                  front: imageFromSource(card.front, fit: BoxFit.cover),
-                  back: imageFromSource(card.back, fit: BoxFit.cover),
-                ),
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-// ============================================================================
-// [ SWIPE VIEWER PAGE ] - horizontal swipe between cards
+// [ SWIPE VIEWER PAGE ] - horizontal swipe + grading (0–5) + edit/delete
 // ============================================================================
 
 class SwipeViewerPage extends StatefulWidget {
@@ -1561,6 +1807,7 @@ class SwipeViewerPage extends StatefulWidget {
   final int initialIndex;
   final Future<void> Function(FlashcardData)? onEdit;
   final Future<void> Function(FlashcardData)? onDelete;
+  final Future<void> Function(FlashcardData, int q)? onGrade;
 
   const SwipeViewerPage({
     super.key,
@@ -1568,6 +1815,7 @@ class SwipeViewerPage extends StatefulWidget {
     required this.initialIndex,
     this.onEdit,
     this.onDelete,
+    this.onGrade,
   });
 
   @override
@@ -1577,6 +1825,7 @@ class SwipeViewerPage extends StatefulWidget {
 class _SwipeViewerPageState extends State<SwipeViewerPage> {
   late final PageController _controller;
   late int _index;
+  bool _showBack = false;
 
   @override
   void initState() {
@@ -1602,34 +1851,53 @@ class _SwipeViewerPageState extends State<SwipeViewerPage> {
     }
   }
 
+  Widget _gradeBar(FlashcardData c) {
+    // 0..5 buttons (SM-2 quality)
+    final labels = ['0','1','2','3','4','5'];
+    return Wrap(
+      spacing: 6,
+      children: List.generate(6, (i) {
+        return ElevatedButton(
+          onPressed: widget.onGrade == null ? null : () async {
+            await widget.onGrade!(c, i);
+            if (!mounted) return;
+            // auto-next on grade
+            if (_index < widget.cards.length - 1) _go(1);
+          },
+          child: Text(labels[i]),
+        );
+      }),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (widget.cards.isEmpty) {
       return const Scaffold(body: Center(child: Text('No cards')));
     }
 
+    final card = widget.cards[_index];
+
     return Scaffold(
       appBar: AppBar(
-        title: Text(
-            '${widget.cards[_index].title}  (${_index + 1}/${widget.cards.length})'),
+        title: Text('${card.title}  (${_index + 1}/${widget.cards.length})'),
         actions: [
           if (widget.onEdit != null)
             IconButton(
               icon: const Icon(Icons.edit),
-              onPressed: () => widget.onEdit!(widget.cards[_index]),
+              onPressed: () => widget.onEdit!(card),
               tooltip: 'Edit',
             ),
           if (widget.onDelete != null)
             IconButton(
               icon: const Icon(Icons.delete),
               onPressed: () async {
-                final current = widget.cards[_index];
-                await widget.onDelete!(current);
+                await widget.onDelete!(card);
                 if (!mounted) return;
                 if (_index >= widget.cards.length) {
                   Navigator.pop(context);
                 } else {
-                  setState(() {}); // reflect deck changes
+                  setState(() {});
                 }
               },
               tooltip: 'Delete',
@@ -1638,28 +1906,45 @@ class _SwipeViewerPageState extends State<SwipeViewerPage> {
       ),
       body: PageView.builder(
         controller: _controller,
-        onPageChanged: (i) => setState(() => _index = i),
+        onPageChanged: (i) => setState(() {
+          _index = i;
+          _showBack = false;
+        }),
         itemCount: widget.cards.length,
         itemBuilder: (_, i) {
-          final card = widget.cards[i];
+          final c = widget.cards[i];
           return Center(
             child: Padding(
               padding: const EdgeInsets.all(16),
-              child: Card(
-                elevation: 6,
-                shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(16)),
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(16),
-                  child: SizedBox(
-                    width: 320,
-                    height: 420,
-                    child: FlipCard(
-                      front: imageFromSource(card.front, fit: BoxFit.cover),
-                      back: imageFromSource(card.back, fit: BoxFit.cover),
+              child: Column(
+                children: [
+                  Card(
+                    elevation: 6,
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16)),
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(16),
+                      child: SizedBox(
+                        width: 320,
+                        height: 420,
+                        child: FlipCard(
+                          front: sideView(kind: c.frontKind, value: c.front, fit: BoxFit.cover),
+                          back:  sideView(kind: c.backKind,  value: c.back,  fit: BoxFit.cover),
+                        ),
+                      ),
                     ),
                   ),
-                ),
+                  const SizedBox(height: 12),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Text('Score: ${(c.score*100).toStringAsFixed(0)}% · EF ${c.ease.toStringAsFixed(2)}'
+                          '${c.due != null ? ' · due ${c.due!.toLocal().toString().split(" ").first}' : ''}'),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  _gradeBar(c),
+                ],
               ),
             ),
           );
